@@ -26,10 +26,28 @@ SENSOR_NAMES = [
 OBSTACLE_THRESHOLD = 80.0  # proximity value that counts as "something is close"
 MAX_SPEED = 6.28           # max motor speed in rad/s for e-puck
 CRUISE_SPEED = 0.9 * MAX_SPEED
-LIDAR_PRINT_EVERY_STEPS = 10
+LIDAR_STATUS_HEARTBEAT_STEPS = 240
 LIDAR_VALUE_AT_1_METER = 1000.0
 LIDAR_MAX_RANGE_M = 1.0
 LIDAR_NO_HIT_MARGIN = 1.0
+LIDAR_MIN_VALID_HIT_M = 0.03
+LIDAR_MAX_VALID_HIT_M = 0.95
+
+# Launch behavior from hub to room (local odometry frame waypoints in meters)
+LAUNCH_WAYPOINTS = (
+    (0.22, 1.75),  # doorway near the assigned room
+    (1.47, 1.75),  # room interior
+)
+LAUNCH_WAYPOINT_REACHED_M = 0.18
+LAUNCH_ENABLE_MAPPING_AT_WAYPOINT = 1
+LAUNCH_TIMEOUT_STEPS = 2500
+LAUNCH_DISTANCE_GAIN = 4.0
+LAUNCH_MIN_SPEED = 0.25 * MAX_SPEED
+LAUNCH_MAX_SPEED = 0.70 * MAX_SPEED
+LAUNCH_TURN_GAIN = 2.2
+LAUNCH_TURN_LIMIT = 0.50 * MAX_SPEED
+LAUNCH_SPIN_THRESHOLD_RAD = 1.05
+LAUNCH_SPIN_SPEED = 0.45 * MAX_SPEED
 
 # Corner recovery behavior
 CORNER_PRESSURE_TRIGGER_STEPS = 6
@@ -46,6 +64,7 @@ AXLE_LENGTH_M = 0.053
 GRID_UNKNOWN = -1
 GRID_FREE = 0
 GRID_WALL = 1
+CONTROLLER_BUILD = "2026-04-10-log-throttle-v4"
 
 
 class OccupancyGrid:
@@ -101,11 +120,16 @@ def normalize_angle(angle_rad):
     return math.atan2(math.sin(angle_rad), math.cos(angle_rad))
 
 
+def clamp(value, low, high):
+    """Clamp a number between low and high."""
+    return max(low, min(high, value))
+
+
 def run():
     robot = Robot()
     timestep = int(robot.getBasicTimeStep())
     robot_name = robot.getName()
-    print(f"[{robot_name}] Starting up")
+    print(f"[{robot_name}] Starting up ({CONTROLLER_BUILD})")
 
     # Create local map storage (6m world / 5cm per cell = 120x120).
     occupancy_grid = OccupancyGrid(world_size_m=6.0, cell_size_m=0.05)
@@ -154,9 +178,29 @@ def run():
     escape_reverse_steps = 0
     escape_turn_steps = 0
     escape_turn_left = True
+    launch_waypoint_index = 0
+    mapping_enabled = len(LAUNCH_WAYPOINTS) == 0
+    last_lidar_log_key = None
+    last_lidar_log_step = -LIDAR_STATUS_HEARTBEAT_STEPS
+
+    def should_log_lidar(log_key):
+        nonlocal last_lidar_log_key, last_lidar_log_step
+
+        state_changed = log_key != last_lidar_log_key
+        heartbeat_due = (step_count - last_lidar_log_step) >= LIDAR_STATUS_HEARTBEAT_STEPS
+        if state_changed or heartbeat_due:
+            last_lidar_log_key = log_key
+            last_lidar_log_step = step_count
+            return True
+        return False
 
     while robot.step(timestep) != -1:
         step_count += 1
+
+        if not mapping_enabled and step_count >= LAUNCH_TIMEOUT_STEPS:
+            mapping_enabled = True
+            print(f"[{robot_name}] Launch timeout reached")
+            print(f"[{robot_name}] Mapping enabled")
 
         # Update a simple odometry estimate from the previous wheel commands.
         left_linear_mps = left_speed_cmd * WHEEL_RADIUS_M
@@ -179,19 +223,73 @@ def run():
                     LIDAR_MAX_RANGE_M,
                     max(0.0, lidar_value / LIDAR_VALUE_AT_1_METER),
                 )
-                hit_x_m = robot_x_m + lidar_distance_m * math.cos(robot_theta_rad)
-                hit_y_m = robot_y_m + lidar_distance_m * math.sin(robot_theta_rad)
-                marked = occupancy_grid.mark_wall(hit_x_m, hit_y_m)
-
-                if step_count % LIDAR_PRINT_EVERY_STEPS == 0:
+                valid_hit = LIDAR_MIN_VALID_HIT_M <= lidar_distance_m <= LIDAR_MAX_VALID_HIT_M
+                if mapping_enabled and valid_hit:
+                    hit_x_m = robot_x_m + lidar_distance_m * math.cos(robot_theta_rad)
+                    hit_y_m = robot_y_m + lidar_distance_m * math.sin(robot_theta_rad)
+                    marked = occupancy_grid.mark_wall(hit_x_m, hit_y_m)
                     update_tag = "new" if marked else "repeat"
+                    if should_log_lidar(f"wall:{update_tag}"):
+                        print(
+                            f"[{robot_name}] lidar={lidar_value:.1f} "
+                            f"dist={lidar_distance_m:.3f}m "
+                            f"wall={update_tag} total={occupancy_grid.wall_cell_count}"
+                        )
+                else:
+                    hold_reason = "launch_hold" if not mapping_enabled else "out_of_range"
+                    if should_log_lidar(hold_reason):
+                        print(
+                            f"[{robot_name}] lidar={lidar_value:.1f} "
+                            f"dist={lidar_distance_m:.3f}m {hold_reason}"
+                        )
+            else:
+                if should_log_lidar("no_hit"):
+                    print(f"[{robot_name}] lidar={lidar_value:.1f} no_hit")
+
+        launch_left_speed = None
+        launch_right_speed = None
+        if launch_waypoint_index < len(LAUNCH_WAYPOINTS):
+            target_x_m, target_y_m = LAUNCH_WAYPOINTS[launch_waypoint_index]
+            delta_x_m = target_x_m - robot_x_m
+            delta_y_m = target_y_m - robot_y_m
+            target_distance_m = math.hypot(delta_x_m, delta_y_m)
+
+            if target_distance_m <= LAUNCH_WAYPOINT_REACHED_M:
+                launch_waypoint_index += 1
+                if (
+                    not mapping_enabled
+                    and launch_waypoint_index >= LAUNCH_ENABLE_MAPPING_AT_WAYPOINT
+                ):
+                    mapping_enabled = True
+                    print(f"[{robot_name}] Mapping enabled")
+                if launch_waypoint_index >= len(LAUNCH_WAYPOINTS):
+                    print(f"[{robot_name}] Launch complete")
+                else:
                     print(
-                        f"[{robot_name}] lidar={lidar_value:.1f} "
-                        f"dist={lidar_distance_m:.3f}m "
-                        f"wall={update_tag} total={occupancy_grid.wall_cell_count}"
+                        f"[{robot_name}] Launch waypoint "
+                        f"{launch_waypoint_index}/{len(LAUNCH_WAYPOINTS)} reached"
                     )
-            elif step_count % LIDAR_PRINT_EVERY_STEPS == 0:
-                print(f"[{robot_name}] lidar={lidar_value:.1f} no_hit")
+            else:
+                target_heading_rad = math.atan2(delta_y_m, delta_x_m)
+                heading_error_rad = normalize_angle(target_heading_rad - robot_theta_rad)
+
+                if abs(heading_error_rad) > LAUNCH_SPIN_THRESHOLD_RAD:
+                    spin_speed = LAUNCH_SPIN_SPEED if heading_error_rad > 0 else -LAUNCH_SPIN_SPEED
+                    launch_left_speed = -spin_speed
+                    launch_right_speed = spin_speed
+                else:
+                    forward_speed = clamp(
+                        LAUNCH_DISTANCE_GAIN * target_distance_m,
+                        LAUNCH_MIN_SPEED,
+                        LAUNCH_MAX_SPEED,
+                    )
+                    turn_speed = clamp(
+                        LAUNCH_TURN_GAIN * heading_error_rad,
+                        -LAUNCH_TURN_LIMIT,
+                        LAUNCH_TURN_LIMIT,
+                    )
+                    launch_left_speed = clamp(forward_speed - turn_speed, -MAX_SPEED, MAX_SPEED)
+                    launch_right_speed = clamp(forward_speed + turn_speed, -MAX_SPEED, MAX_SPEED)
 
         # Check for obstacles on each side
         front_left = values[7] > OBSTACLE_THRESHOLD
@@ -264,6 +362,10 @@ def run():
             # Slight right turn to avoid left-side obstacle
             left_speed = 0.8 * MAX_SPEED
             right_speed = 0.3 * MAX_SPEED
+        elif launch_left_speed is not None and launch_right_speed is not None:
+            # Follow launch waypoints when there is no immediate obstacle pressure.
+            left_speed = launch_left_speed
+            right_speed = launch_right_speed
         else:
             # No obstacles, drive straight
             left_speed = CRUISE_SPEED
