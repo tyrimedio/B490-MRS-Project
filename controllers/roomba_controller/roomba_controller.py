@@ -23,6 +23,36 @@ SENSOR_NAMES = [
 
 OBSTACLE_THRESHOLD = 80.0  # proximity value that counts as "something is close"
 MAX_SPEED = 6.28           # max motor speed in rad/s for e-puck
+LIDAR_PRINT_EVERY_STEPS = 10
+
+# Occupancy-grid cell states
+GRID_UNKNOWN = -1
+GRID_FREE = 0
+GRID_WALL = 1
+
+
+class OccupancyGrid:
+    """
+    Small 2D map stored as a grid (like graph paper).
+
+    Each cell starts as UNKNOWN and can later be marked FREE or WALL.
+    This class currently handles grid allocation and reset.
+    """
+
+    def __init__(self, world_size_m=6.0, cell_size_m=0.05):
+        self.world_size_m = world_size_m
+        self.cell_size_m = cell_size_m
+        self.width = int(round(world_size_m / cell_size_m))
+        self.height = int(round(world_size_m / cell_size_m))
+        self.data = []
+        self.reset()
+
+    def reset(self):
+        """Reset every cell to UNKNOWN."""
+        self.data = [
+            [GRID_UNKNOWN for _ in range(self.width)]
+            for _ in range(self.height)
+        ]
 
 
 def run():
@@ -30,6 +60,14 @@ def run():
     timestep = int(robot.getBasicTimeStep())
     robot_name = robot.getName()
     print(f"[{robot_name}] Starting up")
+
+    # Create local map storage (6m world / 5cm per cell = 120x120).
+    occupancy_grid = OccupancyGrid(world_size_m=6.0, cell_size_m=0.05)
+    occupancy_grid.reset()
+    print(
+        f"[{robot_name}] Occupancy grid ready: "
+        f"{occupancy_grid.width}x{occupancy_grid.height} cells"
+    )
 
     # Initialize proximity sensors
     sensors = []
@@ -39,9 +77,17 @@ def run():
         sensors.append(sensor)
 
     # Initialize turret-mounted lidar sensor (if present)
-    lidar = robot.getDevice("lidar")
-    if lidar:
+    lidar = None
+    try:
+        lidar = robot.getDevice("lidar")
+    except Exception:
+        lidar = None
+
+    if lidar is not None:
         lidar.enable(timestep)
+        print(f"[{robot_name}] Lidar enabled")
+    else:
+        print(f"[{robot_name}] Lidar not found")
 
     # Initialize motors
     left_motor = robot.getDevice("left wheel motor")
@@ -51,9 +97,17 @@ def run():
     left_motor.setVelocity(0.0)
     right_motor.setVelocity(0.0)
 
+    step_count = 0
     while robot.step(timestep) != -1:
+        step_count += 1
+
         # Read all proximity sensor values
         values = [s.getValue() for s in sensors]
+
+        # Print lidar values at a steady interval to confirm live sensor updates.
+        if lidar is not None and step_count % LIDAR_PRINT_EVERY_STEPS == 0:
+            lidar_value = lidar.getValue()
+            print(f"[{robot_name}] lidar={lidar_value:.4f}")
 
         # Check for obstacles on each side
         front_left = values[7] > OBSTACLE_THRESHOLD
