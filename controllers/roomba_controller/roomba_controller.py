@@ -7,6 +7,7 @@ Each robot drives forward and turns when it detects an obstacle, covering
 its assigned area with a sweeping pattern.
 """
 
+import json
 import math
 
 from controller import Robot
@@ -32,12 +33,28 @@ LIDAR_MAX_RANGE_M = 1.0
 LIDAR_NO_HIT_MARGIN = 1.0
 LIDAR_MIN_VALID_HIT_M = 0.03
 LIDAR_MAX_VALID_HIT_M = 0.95
+COMMUNICATION_SEND_INTERVAL_STEPS = 30
 
-# Launch behavior from hub to room (local odometry frame waypoints in meters)
-LAUNCH_WAYPOINTS = (
-    (0.22, 1.75),  # doorway near the assigned room
-    (1.47, 1.75),  # room interior
-)
+# Initial Webots poses for the four robots in the shared world frame.
+# These match the robot translations and rotations in worlds/roomba_cluster.wbt.
+ROBOT_START_POSES = {
+    "epuck_1": (0.0, 0.28, 0.5 * math.pi),
+    "epuck_2": (0.28, 0.0, 0.0),
+    "epuck_3": (0.0, -0.28, -0.5 * math.pi),
+    "epuck_4": (-0.28, 0.0, math.pi),
+}
+
+# Launch behavior from hub to room (world-frame waypoints in meters).
+# Each robot exits the central hub through a different doorway, then moves
+# toward the middle of its assigned corner room.
+ROBOT_LAUNCH_WAYPOINTS = {
+    "epuck_1": ((0.0, 1.75), (-1.75, 1.75)),     # northwest room
+    "epuck_2": ((1.75, 0.0), (1.75, 1.75)),      # northeast room
+    "epuck_3": ((0.0, -1.75), (1.75, -1.75)),    # southeast room
+    "epuck_4": ((-1.75, 0.0), (-1.75, -1.75)),   # southwest room
+}
+DEFAULT_START_POSE = (0.0, 0.0, 0.0)
+DEFAULT_LAUNCH_WAYPOINTS = ()
 LAUNCH_WAYPOINT_REACHED_M = 0.18
 LAUNCH_ENABLE_MAPPING_AT_WAYPOINT = 1
 LAUNCH_TIMEOUT_STEPS = 2500
@@ -125,11 +142,34 @@ def clamp(value, low, high):
     return max(low, min(high, value))
 
 
+def get_optional_device(robot, device_name):
+    """Return a Webots device if it exists on this robot."""
+    try:
+        return robot.getDevice(device_name)
+    except Exception:
+        return None
+
+
 def run():
     robot = Robot()
     timestep = int(robot.getBasicTimeStep())
     robot_name = robot.getName()
     print(f"[{robot_name}] Starting up ({CONTROLLER_BUILD})")
+    launch_waypoints = ROBOT_LAUNCH_WAYPOINTS.get(
+        robot_name,
+        DEFAULT_LAUNCH_WAYPOINTS,
+    )
+    start_x_m, start_y_m, start_theta_rad = ROBOT_START_POSES.get(
+        robot_name,
+        DEFAULT_START_POSE,
+    )
+    if launch_waypoints:
+        print(
+            f"[{robot_name}] Launch target loaded: "
+            f"{len(launch_waypoints)} waypoint(s)"
+        )
+    else:
+        print(f"[{robot_name}] No launch target; mapping starts immediately")
 
     # Create local map storage (6m world / 5cm per cell = 120x120).
     occupancy_grid = OccupancyGrid(world_size_m=6.0, cell_size_m=0.05)
@@ -147,17 +187,26 @@ def run():
         sensors.append(sensor)
 
     # Initialize turret-mounted lidar sensor (if present)
-    lidar = None
-    try:
-        lidar = robot.getDevice("lidar")
-    except Exception:
-        lidar = None
+    lidar = get_optional_device(robot, "lidar")
 
     if lidar is not None:
         lidar.enable(timestep)
         print(f"[{robot_name}] Lidar enabled")
     else:
         print(f"[{robot_name}] Lidar not found")
+
+    emitter = get_optional_device(robot, "emitter")
+    if emitter is not None:
+        print(f"[{robot_name}] Communication emitter ready")
+    else:
+        print(f"[{robot_name}] Communication emitter not found")
+
+    receiver = get_optional_device(robot, "receiver")
+    if receiver is not None:
+        receiver.enable(timestep)
+        print(f"[{robot_name}] Communication receiver ready")
+    else:
+        print(f"[{robot_name}] Communication receiver not found")
 
     # Initialize motors
     left_motor = robot.getDevice("left wheel motor")
@@ -171,15 +220,16 @@ def run():
     step_count = 0
     left_speed_cmd = 0.0
     right_speed_cmd = 0.0
-    robot_x_m = 0.0
-    robot_y_m = 0.0
-    robot_theta_rad = 0.0
+    robot_x_m = start_x_m
+    robot_y_m = start_y_m
+    robot_theta_rad = start_theta_rad
     corner_pressure_steps = 0
     escape_reverse_steps = 0
     escape_turn_steps = 0
     escape_turn_left = True
     launch_waypoint_index = 0
-    mapping_enabled = len(LAUNCH_WAYPOINTS) == 0
+    mapping_enabled = len(launch_waypoints) == 0
+    last_wall_hit = None
     last_lidar_log_key = None
     last_lidar_log_step = -LIDAR_STATUS_HEARTBEAT_STEPS
 
@@ -215,6 +265,12 @@ def run():
         # Read all proximity sensor values
         values = [s.getValue() for s in sensors]
 
+        if receiver is not None:
+            while receiver.getQueueLength() > 0:
+                command = receiver.getString()
+                print(f"[{robot_name}] Supervisor command received: {command}")
+                receiver.nextPacket()
+
         if lidar is not None:
             lidar_value = lidar.getValue()
             has_lidar_hit = lidar_value < (LIDAR_VALUE_AT_1_METER - LIDAR_NO_HIT_MARGIN)
@@ -228,6 +284,11 @@ def run():
                     hit_x_m = robot_x_m + lidar_distance_m * math.cos(robot_theta_rad)
                     hit_y_m = robot_y_m + lidar_distance_m * math.sin(robot_theta_rad)
                     marked = occupancy_grid.mark_wall(hit_x_m, hit_y_m)
+                    last_wall_hit = {
+                        "x_m": round(hit_x_m, 3),
+                        "y_m": round(hit_y_m, 3),
+                        "distance_m": round(lidar_distance_m, 3),
+                    }
                     update_tag = "new" if marked else "repeat"
                     if should_log_lidar(f"wall:{update_tag}"):
                         print(
@@ -248,8 +309,8 @@ def run():
 
         launch_left_speed = None
         launch_right_speed = None
-        if launch_waypoint_index < len(LAUNCH_WAYPOINTS):
-            target_x_m, target_y_m = LAUNCH_WAYPOINTS[launch_waypoint_index]
+        if launch_waypoint_index < len(launch_waypoints):
+            target_x_m, target_y_m = launch_waypoints[launch_waypoint_index]
             delta_x_m = target_x_m - robot_x_m
             delta_y_m = target_y_m - robot_y_m
             target_distance_m = math.hypot(delta_x_m, delta_y_m)
@@ -262,12 +323,12 @@ def run():
                 ):
                     mapping_enabled = True
                     print(f"[{robot_name}] Mapping enabled")
-                if launch_waypoint_index >= len(LAUNCH_WAYPOINTS):
+                if launch_waypoint_index >= len(launch_waypoints):
                     print(f"[{robot_name}] Launch complete")
                 else:
                     print(
                         f"[{robot_name}] Launch waypoint "
-                        f"{launch_waypoint_index}/{len(LAUNCH_WAYPOINTS)} reached"
+                        f"{launch_waypoint_index}/{len(launch_waypoints)} reached"
                     )
             else:
                 target_heading_rad = math.atan2(delta_y_m, delta_x_m)
@@ -375,6 +436,27 @@ def run():
         right_speed_cmd = right_speed
         left_motor.setVelocity(left_speed)
         right_motor.setVelocity(right_speed)
+
+        if emitter is not None and step_count % COMMUNICATION_SEND_INTERVAL_STEPS == 0:
+            message = {
+                "type": "robot_status",
+                "robot": robot_name,
+                "step": step_count,
+                "pose": {
+                    "x_m": round(robot_x_m, 3),
+                    "y_m": round(robot_y_m, 3),
+                    "theta_rad": round(robot_theta_rad, 3),
+                },
+                "launch": {
+                    "waypoint_index": launch_waypoint_index,
+                    "waypoint_count": len(launch_waypoints),
+                    "complete": launch_waypoint_index >= len(launch_waypoints),
+                },
+                "mapping_enabled": mapping_enabled,
+                "wall_cell_count": occupancy_grid.wall_cell_count,
+                "last_wall_hit": last_wall_hit,
+            }
+            emitter.send(json.dumps(message))
 
 
 if __name__ == "__main__":

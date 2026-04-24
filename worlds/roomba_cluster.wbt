@@ -335,6 +335,8 @@ DEF EPUCK_1 E-puck {
   rotation 0 0 1 1.57079632679
   name "epuck_1"
   controller "roomba_controller"
+  emitter_channel 1
+  receiver_channel 2
   turretSlot [
     DEF LIDAR DistanceSensor {
       name "lidar"
@@ -350,6 +352,8 @@ DEF EPUCK_2 E-puck {
   rotation 0 0 1 0
   name "epuck_2"
   controller "roomba_controller"
+  emitter_channel 1
+  receiver_channel 2
   turretSlot [
     DEF LIDAR DistanceSensor {
       name "lidar"
@@ -365,6 +369,8 @@ DEF EPUCK_3 E-puck {
   rotation 0 0 1 -1.57079632679
   name "epuck_3"
   controller "roomba_controller"
+  emitter_channel 1
+  receiver_channel 2
   turretSlot [
     DEF LIDAR DistanceSensor {
       name "lidar"
@@ -380,6 +386,8 @@ DEF EPUCK_4 E-puck {
   rotation 0 0 1 3.14159265359
   name "epuck_4"
   controller "roomba_controller"
+  emitter_channel 1
+  receiver_channel 2
   turretSlot [
     DEF LIDAR DistanceSensor {
       name "lidar"
@@ -387,6 +395,21 @@ DEF EPUCK_4 E-puck {
         0 0 0
         1 1000 0
       ]
+    }
+  ]
+}
+DEF CENTRAL_SUPERVISOR Robot {
+  name "central_supervisor"
+  controller "roomba_supervisor"
+  supervisor TRUE
+  children [
+    Receiver {
+      name "receiver"
+      channel 1
+    }
+    Emitter {
+      name "emitter"
+      channel 2
     }
   ]
 }
