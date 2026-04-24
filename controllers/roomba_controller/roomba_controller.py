@@ -99,6 +99,9 @@ class OccupancyGrid:
         self.height = int(round(world_size_m / cell_size_m))
         self.data = []
         self.wall_cell_count = 0
+        self.free_cell_count = 0
+        self.pending_free_cells = set()
+        self.pending_wall_cells = set()
         self.reset()
 
     def reset(self):
@@ -108,6 +111,9 @@ class OccupancyGrid:
             for _ in range(self.height)
         ]
         self.wall_cell_count = 0
+        self.free_cell_count = 0
+        self.pending_free_cells = set()
+        self.pending_wall_cells = set()
 
     def world_to_grid(self, x_m, y_m):
         """Convert local map coordinates in meters to grid cell indices."""
@@ -125,11 +131,72 @@ class OccupancyGrid:
             return False
 
         grid_x, grid_y = grid_cell
-        if self.data[grid_y][grid_x] != GRID_WALL:
-            self.data[grid_y][grid_x] = GRID_WALL
-            self.wall_cell_count += 1
-            return True
-        return False
+        return self.mark_wall_cell(grid_x, grid_y)
+
+    def mark_wall_cell(self, grid_x, grid_y):
+        """Mark a grid cell as WALL using grid coordinates."""
+        current_value = self.data[grid_y][grid_x]
+        if current_value == GRID_WALL:
+            return False
+
+        if current_value == GRID_FREE:
+            self.free_cell_count -= 1
+
+        self.data[grid_y][grid_x] = GRID_WALL
+        self.wall_cell_count += 1
+        cell = (grid_x, grid_y)
+        self.pending_wall_cells.add(cell)
+        self.pending_free_cells.discard(cell)
+        return True
+
+    def mark_free_cell(self, grid_x, grid_y):
+        """Mark a grid cell as FREE unless it is already known to be a wall."""
+        current_value = self.data[grid_y][grid_x]
+        if current_value in (GRID_FREE, GRID_WALL):
+            return False
+
+        self.data[grid_y][grid_x] = GRID_FREE
+        self.free_cell_count += 1
+        self.pending_free_cells.add((grid_x, grid_y))
+        return True
+
+    def mark_free_line(self, start_x_m, start_y_m, end_x_m, end_y_m):
+        """
+        Mark open cells along a lidar beam.
+
+        The robot is at the start point. The wall is at the end point. Every
+        grid square before the wall is treated as open floor.
+        """
+        wall_cell = self.world_to_grid(end_x_m, end_y_m)
+        distance_m = math.hypot(end_x_m - start_x_m, end_y_m - start_y_m)
+        if distance_m <= 0.0:
+            return 0
+
+        sample_count = max(1, int(math.ceil(distance_m / (0.5 * self.cell_size_m))))
+        changed_count = 0
+        for sample_index in range(sample_count):
+            ratio = sample_index / sample_count
+            sample_x_m = start_x_m + ratio * (end_x_m - start_x_m)
+            sample_y_m = start_y_m + ratio * (end_y_m - start_y_m)
+            grid_cell = self.world_to_grid(sample_x_m, sample_y_m)
+            if grid_cell is None or grid_cell == wall_cell:
+                continue
+
+            grid_x, grid_y = grid_cell
+            if self.mark_free_cell(grid_x, grid_y):
+                changed_count += 1
+
+        return changed_count
+
+    def drain_pending_updates(self):
+        """Return changed cells and clear the pending update queue."""
+        updates = {
+            "free_cells": [list(cell) for cell in sorted(self.pending_free_cells)],
+            "wall_cells": [list(cell) for cell in sorted(self.pending_wall_cells)],
+        }
+        self.pending_free_cells.clear()
+        self.pending_wall_cells.clear()
+        return updates
 
 
 def normalize_angle(angle_rad):
@@ -283,6 +350,12 @@ def run():
                 if mapping_enabled and valid_hit:
                     hit_x_m = robot_x_m + lidar_distance_m * math.cos(robot_theta_rad)
                     hit_y_m = robot_y_m + lidar_distance_m * math.sin(robot_theta_rad)
+                    free_updates = occupancy_grid.mark_free_line(
+                        robot_x_m,
+                        robot_y_m,
+                        hit_x_m,
+                        hit_y_m,
+                    )
                     marked = occupancy_grid.mark_wall(hit_x_m, hit_y_m)
                     last_wall_hit = {
                         "x_m": round(hit_x_m, 3),
@@ -294,7 +367,9 @@ def run():
                         print(
                             f"[{robot_name}] lidar={lidar_value:.1f} "
                             f"dist={lidar_distance_m:.3f}m "
-                            f"wall={update_tag} total={occupancy_grid.wall_cell_count}"
+                            f"wall={update_tag} free+={free_updates} "
+                            f"free={occupancy_grid.free_cell_count} "
+                            f"walls={occupancy_grid.wall_cell_count}"
                         )
                 else:
                     hold_reason = "launch_hold" if not mapping_enabled else "out_of_range"
@@ -304,7 +379,25 @@ def run():
                             f"dist={lidar_distance_m:.3f}m {hold_reason}"
                         )
             else:
-                if should_log_lidar("no_hit"):
+                logged_clear = False
+                if mapping_enabled:
+                    clear_x_m = robot_x_m + LIDAR_MAX_VALID_HIT_M * math.cos(robot_theta_rad)
+                    clear_y_m = robot_y_m + LIDAR_MAX_VALID_HIT_M * math.sin(robot_theta_rad)
+                    free_updates = occupancy_grid.mark_free_line(
+                        robot_x_m,
+                        robot_y_m,
+                        clear_x_m,
+                        clear_y_m,
+                    )
+                    if free_updates > 0 and should_log_lidar("clear_free"):
+                        print(
+                            f"[{robot_name}] lidar={lidar_value:.1f} "
+                            f"clear free+={free_updates} "
+                            f"free={occupancy_grid.free_cell_count} "
+                            f"walls={occupancy_grid.wall_cell_count}"
+                        )
+                        logged_clear = True
+                if not logged_clear and should_log_lidar("no_hit"):
                     print(f"[{robot_name}] lidar={lidar_value:.1f} no_hit")
 
         launch_left_speed = None
@@ -438,6 +531,7 @@ def run():
         right_motor.setVelocity(right_speed)
 
         if emitter is not None and step_count % COMMUNICATION_SEND_INTERVAL_STEPS == 0:
+            map_update = occupancy_grid.drain_pending_updates()
             message = {
                 "type": "robot_status",
                 "robot": robot_name,
@@ -453,8 +547,10 @@ def run():
                     "complete": launch_waypoint_index >= len(launch_waypoints),
                 },
                 "mapping_enabled": mapping_enabled,
+                "free_cell_count": occupancy_grid.free_cell_count,
                 "wall_cell_count": occupancy_grid.wall_cell_count,
                 "last_wall_hit": last_wall_hit,
+                "map_update": map_update,
             }
             emitter.send(json.dumps(message))
 
