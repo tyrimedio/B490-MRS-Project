@@ -25,6 +25,7 @@ MRTA_DISTANCE_WEIGHT = 1.0
 MRTA_AREA_WEIGHT = 0.05
 COVERAGE_MARGIN_M = 0.125
 COVERAGE_ROW_SPACING_M = 0.35
+COVERAGE_COMPLETE_PERCENT = 95.0
 CLEAN_TILE_SIZE_M = 0.25
 CLEAN_RADIUS_M = 0.18
 CLEAN_TRAIL_SAMPLE_SPACING_M = 0.08
@@ -314,6 +315,7 @@ class CleaningOverlay:
         self.root_children = supervisor.getRoot().getField("children")
         self.tile_appearances = {}
         self.dirty_tiles = set()
+        self.room_tile_counts = {room: 0 for room in rooms}
         self.preview_rooms = set()
         self.active_rooms = set()
         self.enabled = True
@@ -352,6 +354,7 @@ class CleaningOverlay:
                         appearance = shape.getField("appearance").getSFNode()
                         self.tile_appearances[tile_key] = appearance
                         self.dirty_tiles.add(tile_key)
+                        self.room_tile_counts[room] += 1
                     except Exception as exc:
                         self.enabled = False
                         print(f"[supervisor] Cleaning overlay disabled: {exc}")
@@ -428,6 +431,123 @@ class CleaningOverlay:
             cleaned_count += self.mark_clean_near(room, x_m, y_m)
         return cleaned_count
 
+    def dirty_tile_count(self, room):
+        """Return how many cleaning tiles in one room are still dirty."""
+        return sum(1 for tile_room, _, _ in self.dirty_tiles if tile_room == room)
+
+    def cleaned_tile_count(self, room):
+        """Return how many cleaning tiles in one room have been cleaned."""
+        total_tiles = self.room_tile_counts.get(room, 0)
+        return max(0, total_tiles - self.dirty_tile_count(room))
+
+    def room_progress_percent(self, room):
+        """Return how much of one room is clean, from 0 to 100."""
+        total_tiles = self.room_tile_counts.get(room, 0)
+        if total_tiles <= 0:
+            return 0.0
+        return 100.0 * self.cleaned_tile_count(room) / total_tiles
+
+
+def room_reached_coverage_goal(cleaning_overlay, room):
+    """Return True when enough visible cleaning tiles are clean."""
+    return cleaning_overlay.room_progress_percent(room) >= COVERAGE_COMPLETE_PERCENT
+
+
+def room_progress_snapshot(cleaning_overlay):
+    """Return clean percentages for every room in a stable order."""
+    return {
+        room: round(cleaning_overlay.room_progress_percent(room), 1)
+        for room in ROOM_TASKS
+    }
+
+
+def format_room_progress(snapshot):
+    """Format room progress for one compact supervisor log line."""
+    return " ".join(
+        f"{room}={snapshot.get(room, 0.0):.1f}%"
+        for room in ROOM_TASKS
+    )
+
+
+def select_reassignment_room(
+    robot_name,
+    room_assignments,
+    completed_rooms,
+    cleaning_overlay,
+):
+    """
+    Pick the unfinished room that most needs help.
+
+    This is a simple dynamic MRTA step: when one robot finishes, it helps the
+    least-clean unfinished room instead of sitting idle.
+    """
+    current_assignment = room_assignments.get(robot_name)
+    current_room = None
+    if current_assignment is not None:
+        current_room = current_assignment["room"]
+
+    helper_rooms = {
+        assignment["room"]
+        for robot, assignment in room_assignments.items()
+        if robot != robot_name and assignment.get("helper", False)
+    }
+    candidate_rooms = []
+    for room in ROOM_TASKS:
+        if room == current_room or room in completed_rooms or room in helper_rooms:
+            continue
+        progress_percent = cleaning_overlay.room_progress_percent(room)
+        if progress_percent >= COVERAGE_COMPLETE_PERCENT:
+            continue
+        candidate_rooms.append((progress_percent, room))
+
+    if not candidate_rooms:
+        return None
+
+    candidate_rooms.sort()
+    return candidate_rooms[0][1]
+
+
+def build_assignment(robot_status, room, helper=False):
+    """Create one assignment dictionary from the robot pose to a room."""
+    room_x_m, room_y_m = ROOM_TASKS[room]["center"]
+    pose = robot_status["pose"]
+    distance_m = math.hypot(room_x_m - pose["x_m"], room_y_m - pose["y_m"])
+    area_m2 = ROOM_TASKS[room]["area_m2"]
+    cost = MRTA_DISTANCE_WEIGHT * distance_m + MRTA_AREA_WEIGHT * area_m2
+    return {
+        "room": room,
+        "cost": round(cost, 3),
+        "target": ROOM_TASKS[room]["center"],
+        "helper": helper,
+    }
+
+
+def send_assignment_commands(emitter, robot_name, assignment):
+    """Send the room target and coverage path to one robot."""
+    emitter.send(
+        json.dumps(
+            {
+                "type": "task_assignment",
+                "robot": robot_name,
+                "room": assignment["room"],
+                "target": assignment["target"],
+                "cost": assignment["cost"],
+            }
+        )
+    )
+    coverage_plan = generate_coverage_waypoints(assignment["room"])
+    emitter.send(
+        json.dumps(
+            {
+                "type": "coverage_plan",
+                "robot": robot_name,
+                "room": assignment["room"],
+                "waypoints": coverage_plan,
+            }
+        )
+    )
+    return coverage_plan
+
 
 def run():
     supervisor = Supervisor()
@@ -447,6 +567,8 @@ def run():
     last_cleaning_poses = {}
     room_assignments = {}
     coverage_plans = {}
+    completed_rooms = set()
+    completed_robot_rooms = {}
     preview_sent = False
     assignments_sent = False
     step_count = 0
@@ -502,10 +624,13 @@ def run():
                     pose,
                 )
                 if cleaned_count:
+                    room_progress = cleaning_overlay.room_progress_percent(
+                        assignment["room"]
+                    )
                     print(
                         f"[supervisor] Cleaned {cleaned_count} tile(s) in "
                         f"{assignment['room']} with {robot_name}; "
-                        f"dirty_remaining={len(cleaning_overlay.dirty_tiles)}"
+                        f"room_clean={room_progress:.1f}%"
                     )
                 last_cleaning_poses[robot_name] = pose
             else:
@@ -558,24 +683,11 @@ def run():
             if room_assignments:
                 for robot_name, assignment in room_assignments.items():
                     cleaning_overlay.show_dirty_room(assignment["room"])
-                    command = {
-                        "type": "task_assignment",
-                        "robot": robot_name,
-                        "room": assignment["room"],
-                        "target": assignment["target"],
-                        "cost": assignment["cost"],
-                    }
-                    emitter.send(json.dumps(command))
-                    coverage_plans[robot_name] = generate_coverage_waypoints(
-                        assignment["room"]
+                    coverage_plans[robot_name] = send_assignment_commands(
+                        emitter,
+                        robot_name,
+                        assignment,
                     )
-                    plan_command = {
-                        "type": "coverage_plan",
-                        "robot": robot_name,
-                        "room": assignment["room"],
-                        "waypoints": coverage_plans[robot_name],
-                    }
-                    emitter.send(json.dumps(plan_command))
                     print(
                         f"[supervisor] Assigned {robot_name} -> "
                         f"{assignment['room']} cost={assignment['cost']:.3f} "
@@ -583,13 +695,62 @@ def run():
                     )
                 assignments_sent = True
 
+        if assignments_sent:
+            for robot_name in EXPECTED_ROBOTS:
+                status = latest_robot_status.get(robot_name)
+                assignment = room_assignments.get(robot_name)
+                if status is None or assignment is None:
+                    continue
+
+                room = assignment["room"]
+                if not room_reached_coverage_goal(cleaning_overlay, room):
+                    continue
+
+                if room not in completed_rooms:
+                    completed_rooms.add(room)
+                    print(
+                        f"[supervisor] Room {room} reached "
+                        f"{cleaning_overlay.room_progress_percent(room):.1f}% clean"
+                    )
+
+                if completed_robot_rooms.get(robot_name) == room:
+                    continue
+
+                completed_robot_rooms[robot_name] = room
+                next_room = select_reassignment_room(
+                    robot_name,
+                    room_assignments,
+                    completed_rooms,
+                    cleaning_overlay,
+                )
+                if next_room is None:
+                    print(f"[supervisor] {robot_name} has no unfinished room to help")
+                    continue
+
+                next_assignment = build_assignment(status, next_room, helper=True)
+                room_assignments[robot_name] = next_assignment
+                cleaning_overlay.show_dirty_room(next_room)
+                coverage_plans[robot_name] = send_assignment_commands(
+                    emitter,
+                    robot_name,
+                    next_assignment,
+                )
+                last_cleaning_poses.pop(robot_name, None)
+                print(
+                    f"[supervisor] Reassigned {robot_name} to help {next_room}; "
+                    f"room_clean={cleaning_overlay.room_progress_percent(next_room):.1f}% "
+                    f"coverage_waypoints={len(coverage_plans[robot_name])}"
+                )
+
         if step_count % COMMUNICATION_SUMMARY_INTERVAL_STEPS == 0:
             connected_count = len(latest_robot_status)
+            progress_snapshot = room_progress_snapshot(cleaning_overlay)
             print(
                 f"[supervisor] Robot status: "
                 f"{connected_count}/{len(EXPECTED_ROBOTS)} reporting, "
                 f"global_map free={global_grid.free_cell_count} "
-                f"walls={global_grid.wall_cell_count}"
+                f"walls={global_grid.wall_cell_count} "
+                f"room_progress {format_room_progress(progress_snapshot)}"
             )
             for robot_name in EXPECTED_ROBOTS:
                 status = latest_robot_status.get(robot_name)
@@ -604,7 +765,14 @@ def run():
                 room = "unassigned"
                 if assignment is not None:
                     room = assignment["room"]
+                    if assignment.get("helper", False):
+                        room += " (helping)"
                 coverage = status.get("coverage", {})
+                room_progress = 0.0
+                if assignment is not None:
+                    room_progress = cleaning_overlay.room_progress_percent(
+                        assignment["room"]
+                    )
                 pose_text = f"pose=({pose['x_m']:.2f}, {pose['y_m']:.2f}) "
                 if actual_pose is not None:
                     pose_text += (
@@ -618,6 +786,7 @@ def run():
                     f"room={room} "
                     f"coverage={coverage.get('waypoint_index', 0)}/"
                     f"{coverage.get('waypoint_count', 0)} "
+                    f"clean={room_progress:.1f}% "
                     f"free={status.get('free_cell_count', 0)} "
                     f"walls={status['wall_cell_count']}"
                 )
