@@ -65,6 +65,7 @@ LAUNCH_TURN_GAIN = 2.2
 LAUNCH_TURN_LIMIT = 0.50 * MAX_SPEED
 LAUNCH_SPIN_THRESHOLD_RAD = 1.05
 LAUNCH_SPIN_SPEED = 0.45 * MAX_SPEED
+ASSIGNMENT_TARGET_REACHED_M = 0.20
 
 # Corner recovery behavior
 CORNER_PRESSURE_TRIGGER_STEPS = 6
@@ -296,6 +297,10 @@ def run():
     escape_turn_left = True
     launch_waypoint_index = 0
     mapping_enabled = len(launch_waypoints) == 0
+    launch_timed_out = False
+    assigned_room = None
+    assigned_target = None
+    assignment_target_reached = False
     last_wall_hit = None
     last_lidar_log_key = None
     last_lidar_log_step = -LIDAR_STATUS_HEARTBEAT_STEPS
@@ -314,10 +319,13 @@ def run():
     while robot.step(timestep) != -1:
         step_count += 1
 
-        if not mapping_enabled and step_count >= LAUNCH_TIMEOUT_STEPS:
-            mapping_enabled = True
+        launch_finished = launch_waypoint_index >= len(launch_waypoints)
+        if not launch_finished and not launch_timed_out and step_count >= LAUNCH_TIMEOUT_STEPS:
+            launch_timed_out = True
             print(f"[{robot_name}] Launch timeout reached")
-            print(f"[{robot_name}] Mapping enabled")
+            if not mapping_enabled:
+                mapping_enabled = True
+                print(f"[{robot_name}] Mapping enabled")
 
         # Update a simple odometry estimate from the previous wheel commands.
         left_linear_mps = left_speed_cmd * WHEEL_RADIUS_M
@@ -335,7 +343,30 @@ def run():
         if receiver is not None:
             while receiver.getQueueLength() > 0:
                 command = receiver.getString()
-                print(f"[{robot_name}] Supervisor command received: {command}")
+                try:
+                    command_message = json.loads(command)
+                except json.JSONDecodeError:
+                    print(f"[{robot_name}] Supervisor command received: {command}")
+                    receiver.nextPacket()
+                    continue
+
+                if command_message.get("type") == "task_assignment":
+                    target_robot = command_message.get("robot")
+                    if target_robot in (robot_name, "all"):
+                        assigned_room = command_message.get("room")
+                        target = command_message.get("target")
+                        if isinstance(target, list) and len(target) == 2:
+                            assigned_target = (float(target[0]), float(target[1]))
+                            assignment_target_reached = False
+                        else:
+                            assigned_target = None
+                            assignment_target_reached = False
+                        print(
+                            f"[{robot_name}] Assigned to room "
+                            f"{assigned_room}"
+                        )
+                else:
+                    print(f"[{robot_name}] Supervisor command received: {command}")
                 receiver.nextPacket()
 
         if lidar is not None:
@@ -402,7 +433,7 @@ def run():
 
         launch_left_speed = None
         launch_right_speed = None
-        if launch_waypoint_index < len(launch_waypoints):
+        if launch_waypoint_index < len(launch_waypoints) and not launch_timed_out:
             target_x_m, target_y_m = launch_waypoints[launch_waypoint_index]
             delta_x_m = target_x_m - robot_x_m
             delta_y_m = target_y_m - robot_y_m
@@ -444,6 +475,52 @@ def run():
                     )
                     launch_left_speed = clamp(forward_speed - turn_speed, -MAX_SPEED, MAX_SPEED)
                     launch_right_speed = clamp(forward_speed + turn_speed, -MAX_SPEED, MAX_SPEED)
+
+        assignment_left_speed = None
+        assignment_right_speed = None
+        launch_finished = launch_waypoint_index >= len(launch_waypoints)
+        if (
+            assigned_target is not None
+            and not assignment_target_reached
+            and (launch_finished or launch_timed_out)
+        ):
+            target_x_m, target_y_m = assigned_target
+            delta_x_m = target_x_m - robot_x_m
+            delta_y_m = target_y_m - robot_y_m
+            target_distance_m = math.hypot(delta_x_m, delta_y_m)
+
+            if target_distance_m <= ASSIGNMENT_TARGET_REACHED_M:
+                assignment_target_reached = True
+                print(f"[{robot_name}] Reached assigned room {assigned_room}")
+            else:
+                target_heading_rad = math.atan2(delta_y_m, delta_x_m)
+                heading_error_rad = normalize_angle(target_heading_rad - robot_theta_rad)
+
+                if abs(heading_error_rad) > LAUNCH_SPIN_THRESHOLD_RAD:
+                    spin_speed = LAUNCH_SPIN_SPEED if heading_error_rad > 0 else -LAUNCH_SPIN_SPEED
+                    assignment_left_speed = -spin_speed
+                    assignment_right_speed = spin_speed
+                else:
+                    forward_speed = clamp(
+                        LAUNCH_DISTANCE_GAIN * target_distance_m,
+                        LAUNCH_MIN_SPEED,
+                        LAUNCH_MAX_SPEED,
+                    )
+                    turn_speed = clamp(
+                        LAUNCH_TURN_GAIN * heading_error_rad,
+                        -LAUNCH_TURN_LIMIT,
+                        LAUNCH_TURN_LIMIT,
+                    )
+                    assignment_left_speed = clamp(
+                        forward_speed - turn_speed,
+                        -MAX_SPEED,
+                        MAX_SPEED,
+                    )
+                    assignment_right_speed = clamp(
+                        forward_speed + turn_speed,
+                        -MAX_SPEED,
+                        MAX_SPEED,
+                    )
 
         # Check for obstacles on each side
         front_left = values[7] > OBSTACLE_THRESHOLD
@@ -520,6 +597,10 @@ def run():
             # Follow launch waypoints when there is no immediate obstacle pressure.
             left_speed = launch_left_speed
             right_speed = launch_right_speed
+        elif assignment_left_speed is not None and assignment_right_speed is not None:
+            # Drive toward the supervisor-assigned room after launch.
+            left_speed = assignment_left_speed
+            right_speed = assignment_right_speed
         else:
             # No obstacles, drive straight
             left_speed = CRUISE_SPEED
@@ -545,8 +626,11 @@ def run():
                     "waypoint_index": launch_waypoint_index,
                     "waypoint_count": len(launch_waypoints),
                     "complete": launch_waypoint_index >= len(launch_waypoints),
+                    "timed_out": launch_timed_out,
                 },
                 "mapping_enabled": mapping_enabled,
+                "assigned_room": assigned_room,
+                "assignment_target_reached": assignment_target_reached,
                 "free_cell_count": occupancy_grid.free_cell_count,
                 "wall_cell_count": occupancy_grid.wall_cell_count,
                 "last_wall_hit": last_wall_hit,
