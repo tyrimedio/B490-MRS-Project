@@ -34,6 +34,9 @@ LIDAR_NO_HIT_MARGIN = 1.0
 LIDAR_MIN_VALID_HIT_M = 0.03
 LIDAR_MAX_VALID_HIT_M = 0.95
 COMMUNICATION_SEND_INTERVAL_STEPS = 30
+POSE_CORRECTION_DRIFT_LOG_M = 0.15
+POSE_CORRECTION_HEADING_LOG_RAD = 0.35
+POSE_CORRECTION_LOG_INTERVAL_STEPS = 120
 
 # Initial Webots poses for the four robots in the shared world frame.
 # These match the robot translations and rotations in worlds/roomba_cluster.wbt.
@@ -66,6 +69,7 @@ LAUNCH_TURN_LIMIT = 0.50 * MAX_SPEED
 LAUNCH_SPIN_THRESHOLD_RAD = 1.05
 LAUNCH_SPIN_SPEED = 0.45 * MAX_SPEED
 ASSIGNMENT_TARGET_REACHED_M = 0.20
+COVERAGE_WAYPOINT_REACHED_M = 0.05
 
 # Corner recovery behavior
 CORNER_PRESSURE_TRIGGER_STEPS = 6
@@ -218,6 +222,33 @@ def get_optional_device(robot, device_name):
         return None
 
 
+def drive_toward_target(robot_x_m, robot_y_m, robot_theta_rad, target_x_m, target_y_m):
+    """Return wheel speeds that steer toward one world-frame target point."""
+    delta_x_m = target_x_m - robot_x_m
+    delta_y_m = target_y_m - robot_y_m
+    target_distance_m = math.hypot(delta_x_m, delta_y_m)
+    target_heading_rad = math.atan2(delta_y_m, delta_x_m)
+    heading_error_rad = normalize_angle(target_heading_rad - robot_theta_rad)
+
+    if abs(heading_error_rad) > LAUNCH_SPIN_THRESHOLD_RAD:
+        spin_speed = LAUNCH_SPIN_SPEED if heading_error_rad > 0 else -LAUNCH_SPIN_SPEED
+        return -spin_speed, spin_speed
+
+    forward_speed = clamp(
+        LAUNCH_DISTANCE_GAIN * target_distance_m,
+        LAUNCH_MIN_SPEED,
+        LAUNCH_MAX_SPEED,
+    )
+    turn_speed = clamp(
+        LAUNCH_TURN_GAIN * heading_error_rad,
+        -LAUNCH_TURN_LIMIT,
+        LAUNCH_TURN_LIMIT,
+    )
+    left_speed = clamp(forward_speed - turn_speed, -MAX_SPEED, MAX_SPEED)
+    right_speed = clamp(forward_speed + turn_speed, -MAX_SPEED, MAX_SPEED)
+    return left_speed, right_speed
+
+
 def run():
     robot = Robot()
     timestep = int(robot.getBasicTimeStep())
@@ -301,9 +332,14 @@ def run():
     assigned_room = None
     assigned_target = None
     assignment_target_reached = False
+    coverage_room = None
+    coverage_waypoints = []
+    coverage_waypoint_index = 0
+    coverage_complete = False
     last_wall_hit = None
     last_lidar_log_key = None
     last_lidar_log_step = -LIDAR_STATUS_HEARTBEAT_STEPS
+    last_pose_correction_log_step = -POSE_CORRECTION_LOG_INTERVAL_STEPS
 
     def should_log_lidar(log_key):
         nonlocal last_lidar_log_key, last_lidar_log_step
@@ -365,6 +401,62 @@ def run():
                             f"[{robot_name}] Assigned to room "
                             f"{assigned_room}"
                         )
+                elif command_message.get("type") == "coverage_plan":
+                    target_robot = command_message.get("robot")
+                    if target_robot in (robot_name, "all"):
+                        coverage_room = command_message.get("room")
+                        coverage_waypoints = []
+                        for waypoint in command_message.get("waypoints", []):
+                            if isinstance(waypoint, list) and len(waypoint) == 2:
+                                coverage_waypoints.append(
+                                    (float(waypoint[0]), float(waypoint[1]))
+                                )
+                        coverage_waypoint_index = 0
+                        coverage_complete = len(coverage_waypoints) == 0
+                        print(
+                            f"[{robot_name}] Coverage plan loaded for "
+                            f"{coverage_room}: {len(coverage_waypoints)} waypoint(s)"
+                        )
+                elif command_message.get("type") == "pose_correction":
+                    target_robot = command_message.get("robot")
+                    if target_robot in (robot_name, "all"):
+                        pose = command_message.get("pose", {})
+                        try:
+                            corrected_x_m = float(pose["x_m"])
+                            corrected_y_m = float(pose["y_m"])
+                            corrected_theta_rad = normalize_angle(
+                                float(pose["theta_rad"])
+                            )
+                        except (KeyError, TypeError, ValueError):
+                            receiver.nextPacket()
+                            continue
+
+                        position_error_m = math.hypot(
+                            corrected_x_m - robot_x_m,
+                            corrected_y_m - robot_y_m,
+                        )
+                        heading_error_rad = abs(
+                            normalize_angle(corrected_theta_rad - robot_theta_rad)
+                        )
+                        should_log_pose_correction = (
+                            position_error_m >= POSE_CORRECTION_DRIFT_LOG_M
+                            or heading_error_rad >= POSE_CORRECTION_HEADING_LOG_RAD
+                        ) and (
+                            step_count - last_pose_correction_log_step
+                            >= POSE_CORRECTION_LOG_INTERVAL_STEPS
+                        )
+
+                        robot_x_m = corrected_x_m
+                        robot_y_m = corrected_y_m
+                        robot_theta_rad = corrected_theta_rad
+
+                        if should_log_pose_correction:
+                            last_pose_correction_log_step = step_count
+                            print(
+                                f"[{robot_name}] Pose corrected by supervisor: "
+                                f"position_error={position_error_m:.2f}m "
+                                f"heading_error={heading_error_rad:.2f}rad"
+                            )
                 else:
                     print(f"[{robot_name}] Supervisor command received: {command}")
                 receiver.nextPacket()
@@ -455,26 +547,13 @@ def run():
                         f"{launch_waypoint_index}/{len(launch_waypoints)} reached"
                     )
             else:
-                target_heading_rad = math.atan2(delta_y_m, delta_x_m)
-                heading_error_rad = normalize_angle(target_heading_rad - robot_theta_rad)
-
-                if abs(heading_error_rad) > LAUNCH_SPIN_THRESHOLD_RAD:
-                    spin_speed = LAUNCH_SPIN_SPEED if heading_error_rad > 0 else -LAUNCH_SPIN_SPEED
-                    launch_left_speed = -spin_speed
-                    launch_right_speed = spin_speed
-                else:
-                    forward_speed = clamp(
-                        LAUNCH_DISTANCE_GAIN * target_distance_m,
-                        LAUNCH_MIN_SPEED,
-                        LAUNCH_MAX_SPEED,
-                    )
-                    turn_speed = clamp(
-                        LAUNCH_TURN_GAIN * heading_error_rad,
-                        -LAUNCH_TURN_LIMIT,
-                        LAUNCH_TURN_LIMIT,
-                    )
-                    launch_left_speed = clamp(forward_speed - turn_speed, -MAX_SPEED, MAX_SPEED)
-                    launch_right_speed = clamp(forward_speed + turn_speed, -MAX_SPEED, MAX_SPEED)
+                launch_left_speed, launch_right_speed = drive_toward_target(
+                    robot_x_m,
+                    robot_y_m,
+                    robot_theta_rad,
+                    target_x_m,
+                    target_y_m,
+                )
 
         assignment_left_speed = None
         assignment_right_speed = None
@@ -493,34 +572,41 @@ def run():
                 assignment_target_reached = True
                 print(f"[{robot_name}] Reached assigned room {assigned_room}")
             else:
-                target_heading_rad = math.atan2(delta_y_m, delta_x_m)
-                heading_error_rad = normalize_angle(target_heading_rad - robot_theta_rad)
+                assignment_left_speed, assignment_right_speed = drive_toward_target(
+                    robot_x_m,
+                    robot_y_m,
+                    robot_theta_rad,
+                    target_x_m,
+                    target_y_m,
+                )
 
-                if abs(heading_error_rad) > LAUNCH_SPIN_THRESHOLD_RAD:
-                    spin_speed = LAUNCH_SPIN_SPEED if heading_error_rad > 0 else -LAUNCH_SPIN_SPEED
-                    assignment_left_speed = -spin_speed
-                    assignment_right_speed = spin_speed
+        coverage_left_speed = None
+        coverage_right_speed = None
+        if (
+            assignment_target_reached
+            and coverage_waypoint_index < len(coverage_waypoints)
+            and not coverage_complete
+        ):
+            target_x_m, target_y_m = coverage_waypoints[coverage_waypoint_index]
+            target_distance_m = math.hypot(target_x_m - robot_x_m, target_y_m - robot_y_m)
+            if target_distance_m <= COVERAGE_WAYPOINT_REACHED_M:
+                coverage_waypoint_index += 1
+                if coverage_waypoint_index >= len(coverage_waypoints):
+                    coverage_complete = True
+                    print(f"[{robot_name}] Coverage complete for {coverage_room}")
                 else:
-                    forward_speed = clamp(
-                        LAUNCH_DISTANCE_GAIN * target_distance_m,
-                        LAUNCH_MIN_SPEED,
-                        LAUNCH_MAX_SPEED,
+                    print(
+                        f"[{robot_name}] Coverage waypoint "
+                        f"{coverage_waypoint_index}/{len(coverage_waypoints)} reached"
                     )
-                    turn_speed = clamp(
-                        LAUNCH_TURN_GAIN * heading_error_rad,
-                        -LAUNCH_TURN_LIMIT,
-                        LAUNCH_TURN_LIMIT,
-                    )
-                    assignment_left_speed = clamp(
-                        forward_speed - turn_speed,
-                        -MAX_SPEED,
-                        MAX_SPEED,
-                    )
-                    assignment_right_speed = clamp(
-                        forward_speed + turn_speed,
-                        -MAX_SPEED,
-                        MAX_SPEED,
-                    )
+            else:
+                coverage_left_speed, coverage_right_speed = drive_toward_target(
+                    robot_x_m,
+                    robot_y_m,
+                    robot_theta_rad,
+                    target_x_m,
+                    target_y_m,
+                )
 
         # Check for obstacles on each side
         front_left = values[7] > OBSTACLE_THRESHOLD
@@ -601,6 +687,10 @@ def run():
             # Drive toward the supervisor-assigned room after launch.
             left_speed = assignment_left_speed
             right_speed = assignment_right_speed
+        elif coverage_left_speed is not None and coverage_right_speed is not None:
+            # Sweep through the assigned room after reaching its entry target.
+            left_speed = coverage_left_speed
+            right_speed = coverage_right_speed
         else:
             # No obstacles, drive straight
             left_speed = CRUISE_SPEED
@@ -631,6 +721,12 @@ def run():
                 "mapping_enabled": mapping_enabled,
                 "assigned_room": assigned_room,
                 "assignment_target_reached": assignment_target_reached,
+                "coverage": {
+                    "room": coverage_room,
+                    "waypoint_index": coverage_waypoint_index,
+                    "waypoint_count": len(coverage_waypoints),
+                    "complete": coverage_complete,
+                },
                 "free_cell_count": occupancy_grid.free_cell_count,
                 "wall_cell_count": occupancy_grid.wall_cell_count,
                 "last_wall_hit": last_wall_hit,
