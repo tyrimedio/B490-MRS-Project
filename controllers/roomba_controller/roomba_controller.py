@@ -47,14 +47,14 @@ ROBOT_START_POSES = {
     "epuck_4": (1.5, 0.0, -0.5 * math.pi),
 }
 
-# Launch behavior from the hub corridor into the initial preview room
-# (world-frame waypoints in meters). The first waypoint lines the robot up
-# under its doorway; the second drops it into the room center.
+# Launch carries each robot from its spawn position to the doorway threshold
+# of a nearby room and then stops. Robots wait there for the supervisor's
+# real task assignment instead of committing to a specific room up front.
 ROBOT_LAUNCH_WAYPOINTS = {
-    "epuck_1": ((-2.25, 0.4), (-2.25, 1.875)),   # nw_small
-    "epuck_2": ((-0.4, 0.4), (-0.4, 1.875)),     # n_medium
-    "epuck_3": ((0.4, -0.4), (0.4, -1.875)),     # s_medium
-    "epuck_4": ((2.25, -0.4), (2.25, -1.875)),   # se_small
+    "epuck_1": ((-2.25, 0.4),),
+    "epuck_2": ((-0.4, 0.4),),
+    "epuck_3": ((0.4, -0.4),),
+    "epuck_4": ((2.25, -0.4),),
 }
 DEFAULT_START_POSE = (0.0, 0.0, 0.0)
 DEFAULT_LAUNCH_WAYPOINTS = ()
@@ -247,6 +247,11 @@ def drive_toward_target(robot_x_m, robot_y_m, robot_theta_rad, target_x_m, targe
     left_speed = clamp(forward_speed - turn_speed, -MAX_SPEED, MAX_SPEED)
     right_speed = clamp(forward_speed + turn_speed, -MAX_SPEED, MAX_SPEED)
     return left_speed, right_speed
+
+
+def should_hold_for_assignment(launch_finished, launch_timed_out, assigned_target):
+    """Return whether the robot should wait at launch staging."""
+    return (launch_finished or launch_timed_out) and assigned_target is None
 
 
 def run():
@@ -628,8 +633,12 @@ def run():
         else:
             corner_pressure_steps = 0
 
-        # Decide motor speeds based on obstacles
-        if escape_reverse_steps > 0 and not rear_blocked:
+        # Decide motor speeds based on the highest-priority active behavior.
+        if should_hold_for_assignment(launch_finished, launch_timed_out, assigned_target):
+            # Hold position while waiting for the supervisor to assign a room.
+            left_speed = 0.0
+            right_speed = 0.0
+        elif escape_reverse_steps > 0 and not rear_blocked:
             left_speed = ESCAPE_REVERSE_SPEED
             right_speed = ESCAPE_REVERSE_SPEED
             escape_reverse_steps -= 1

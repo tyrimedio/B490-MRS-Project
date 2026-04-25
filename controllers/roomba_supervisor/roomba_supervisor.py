@@ -19,8 +19,9 @@ ROBOT_DEF_NAMES = {
     "epuck_3": "EPUCK_3",
     "epuck_4": "EPUCK_4",
 }
-ROOM_ASSIGNMENT_PREVIEW_DELAY_STEPS = 60
-MRTA_ASSIGNMENT_DELAY_STEPS = 180
+# Assignment is already gated on every robot finishing its launch waypoints,
+# so we don't need an extra time floor — run MRTA the moment launches complete.
+MRTA_ASSIGNMENT_DELAY_STEPS = 0
 MRTA_DISTANCE_WEIGHT = 1.0
 MRTA_AREA_WEIGHT = 0.05
 COVERAGE_MARGIN_M = 0.125
@@ -29,8 +30,6 @@ COVERAGE_COMPLETE_PERCENT = 95.0
 CLEAN_TILE_SIZE_M = 0.25
 CLEAN_RADIUS_M = 0.18
 CLEAN_TRAIL_SAMPLE_SPACING_M = 0.08
-PREVIEW_TILE_COLOR = [0.34, 0.47, 0.66]
-PREVIEW_TILE_TRANSPARENCY = 0.60
 DIRTY_TILE_COLOR = [0.72, 0.56, 0.32]
 DIRTY_TILE_TRANSPARENCY = 0.35
 CLEAN_TILE_COLOR = [0.18, 0.62, 0.42]
@@ -72,17 +71,6 @@ ROOM_TASKS = {
         "area_m2": 1.5 * 2.25,
     },
 }
-
-# Initial visual preview before MRTA runs. With more rooms than robots, the
-# two large rooms are intentionally left out of the preview so the MRTA
-# reassignment step has unfinished rooms to redirect free robots toward.
-ROOM_ASSIGNMENT_PREVIEW = {
-    "epuck_1": "nw_small",
-    "epuck_2": "n_medium",
-    "epuck_3": "s_medium",
-    "epuck_4": "se_small",
-}
-
 
 def normalize_angle(angle_rad):
     """Keep an angle between -pi and pi."""
@@ -314,9 +302,16 @@ def interpolate_cleaning_path(start_pose, end_pose):
     return points
 
 
-def robot_can_mark_cleaning(robot_status):
-    """Cleaning starts after the robot reaches its assigned room."""
-    return bool(robot_status.get("assignment_target_reached", False))
+def robot_can_mark_cleaning(pose, room):
+    """Cleaning marks turn on once the robot is inside the assigned room's bounds."""
+    if pose is None or room not in ROOM_TASKS:
+        return False
+
+    min_x, max_x, min_y, max_y = ROOM_TASKS[room]["bounds"]
+    return (
+        min_x <= pose["x_m"] <= max_x
+        and min_y <= pose["y_m"] <= max_y
+    )
 
 
 class CleaningOverlay:
@@ -329,7 +324,6 @@ class CleaningOverlay:
         self.tile_appearances = {}
         self.dirty_tiles = set()
         self.room_tile_counts = {room: 0 for room in rooms}
-        self.preview_rooms = set()
         self.active_rooms = set()
         self.enabled = True
         self.create_tiles()
@@ -379,22 +373,6 @@ class CleaningOverlay:
 
         print(f"[supervisor] Cleaning overlay ready: {len(self.dirty_tiles)} dirty tiles")
 
-    def show_preview_room(self, room):
-        """Show one planned room without enabling cleaning marks yet."""
-        if not self.enabled or room in self.preview_rooms or room in self.active_rooms:
-            return
-
-        for tile_key in self.dirty_tiles:
-            tile_room, _, _ = tile_key
-            if tile_room != room:
-                continue
-
-            appearance = self.tile_appearances[tile_key]
-            appearance.getField("baseColor").setSFColor(PREVIEW_TILE_COLOR)
-            appearance.getField("transparency").setSFFloat(PREVIEW_TILE_TRANSPARENCY)
-
-        self.preview_rooms.add(room)
-
     def show_dirty_room(self, room):
         """Make one assigned room's dirty tiles visible."""
         if not self.enabled or room in self.active_rooms:
@@ -409,7 +387,6 @@ class CleaningOverlay:
             appearance.getField("baseColor").setSFColor(DIRTY_TILE_COLOR)
             appearance.getField("transparency").setSFFloat(DIRTY_TILE_TRANSPARENCY)
 
-        self.preview_rooms.discard(room)
         self.active_rooms.add(room)
 
     def mark_clean_near(self, room, x_m, y_m):
@@ -582,7 +559,6 @@ def run():
     coverage_plans = {}
     completed_rooms = set()
     completed_robot_rooms = {}
-    preview_sent = False
     assignments_sent = False
     step_count = 0
     print("[supervisor] Starting central communication hub")
@@ -630,7 +606,7 @@ def run():
             if pose is None:
                 pose = message["pose"]
 
-            if assignment is not None and robot_can_mark_cleaning(message):
+            if assignment is not None and robot_can_mark_cleaning(pose, assignment["room"]):
                 cleaned_count = cleaning_overlay.mark_clean_trail(
                     assignment["room"],
                     last_cleaning_poses.get(robot_name),
@@ -668,18 +644,6 @@ def run():
                         }
                     )
                 )
-
-        ready_for_preview = (
-            not preview_sent
-            and step_count >= ROOM_ASSIGNMENT_PREVIEW_DELAY_STEPS
-            and all(robot in latest_robot_status for robot in EXPECTED_ROBOTS)
-        )
-        if ready_for_preview:
-            for robot_name in EXPECTED_ROBOTS:
-                room = ROOM_ASSIGNMENT_PREVIEW[robot_name]
-                cleaning_overlay.show_preview_room(room)
-                print(f"[supervisor] Preview assignment {robot_name} -> {room}")
-            preview_sent = True
 
         ready_for_assignment = (
             not assignments_sent

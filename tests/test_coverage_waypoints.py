@@ -75,6 +75,31 @@ class CoverageWaypointTests(unittest.TestCase):
 
         self.assertLessEqual(distance_when_reached_m, supervisor.CLEAN_RADIUS_M)
 
+    def test_robot_holds_after_launch_until_assignment_arrives(self):
+        controller = load_controller_module()
+
+        self.assertTrue(
+            controller.should_hold_for_assignment(
+                launch_finished=True,
+                launch_timed_out=False,
+                assigned_target=None,
+            )
+        )
+        self.assertTrue(
+            controller.should_hold_for_assignment(
+                launch_finished=False,
+                launch_timed_out=True,
+                assigned_target=None,
+            )
+        )
+        self.assertFalse(
+            controller.should_hold_for_assignment(
+                launch_finished=True,
+                launch_timed_out=False,
+                assigned_target=(1.0, 1.0),
+            )
+        )
+
     def test_actual_robot_pose_uses_webots_translation(self):
         supervisor_module = load_supervisor_module()
 
@@ -129,18 +154,21 @@ class CoverageWaypointTests(unittest.TestCase):
             supervisor.CLEAN_TRAIL_SAMPLE_SPACING_M + 1e-9,
         )
 
-    def test_cleaning_marks_only_after_assigned_room_is_reached(self):
+    def test_cleaning_marks_only_after_robot_enters_assigned_room(self):
         supervisor = load_supervisor_module()
+        room = "nw_small"
+        min_x, max_x, min_y, max_y = supervisor.ROOM_TASKS[room]["bounds"]
+        inside_pose = {
+            "x_m": 0.5 * (min_x + max_x),
+            "y_m": 0.5 * (min_y + max_y),
+        }
+        outside_pose = {"x_m": 0.0, "y_m": 0.0}
 
+        self.assertFalse(supervisor.robot_can_mark_cleaning(outside_pose, room))
+        self.assertTrue(supervisor.robot_can_mark_cleaning(inside_pose, room))
+        self.assertFalse(supervisor.robot_can_mark_cleaning(None, room))
         self.assertFalse(
-            supervisor.robot_can_mark_cleaning(
-                {"assignment_target_reached": False}
-            )
-        )
-        self.assertTrue(
-            supervisor.robot_can_mark_cleaning(
-                {"assignment_target_reached": True}
-            )
+            supervisor.robot_can_mark_cleaning(inside_pose, "not_a_room")
         )
 
     def test_room_progress_percent_uses_dirty_tiles(self):
