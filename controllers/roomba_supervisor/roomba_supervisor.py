@@ -38,6 +38,12 @@ HIDDEN_TILE_TRANSPARENCY = 1.0
 GRID_UNKNOWN = -1
 GRID_FREE = 0
 GRID_WALL = 1
+FREE_EVIDENCE = -1
+WALL_EVIDENCE = 3
+MIN_OCCUPANCY_SCORE = -8
+MAX_OCCUPANCY_SCORE = 8
+FREE_SCORE_THRESHOLD = -2
+WALL_SCORE_THRESHOLD = 3
 
 ROOM_TASKS = {
     "nw_small": {
@@ -93,12 +99,16 @@ class GlobalOccupancyGrid:
             [GRID_UNKNOWN for _ in range(self.width)]
             for _ in range(self.height)
         ]
+        self.scores = [
+            [0 for _ in range(self.width)]
+            for _ in range(self.height)
+        ]
         self.free_cell_count = 0
         self.wall_cell_count = 0
 
     def is_valid_cell(self, cell):
         """Return True when a [x, y] cell index fits inside the map."""
-        if not isinstance(cell, list) or len(cell) != 2:
+        if not isinstance(cell, (list, tuple)) or len(cell) != 2:
             return False
         grid_x, grid_y = cell
         return (
@@ -108,27 +118,76 @@ class GlobalOccupancyGrid:
             and 0 <= grid_y < self.height
         )
 
-    def mark_free(self, grid_x, grid_y):
-        """Mark one cell as free unless it is already known to be a wall."""
-        current_value = self.data[grid_y][grid_x]
-        if current_value in (GRID_FREE, GRID_WALL):
+    def is_valid_observation(self, observation):
+        """Return True when a [x, y, count] observation is usable."""
+        if not isinstance(observation, list) or len(observation) != 3:
             return False
+        grid_x, grid_y, count = observation
+        return (
+            self.is_valid_cell([grid_x, grid_y])
+            and isinstance(count, int)
+            and count > 0
+        )
 
-        self.data[grid_y][grid_x] = GRID_FREE
-        self.free_cell_count += 1
-        return True
+    def is_valid_ordered_observation(self, observation):
+        """Return True when a [kind, x, y, count] observation is usable."""
+        if not isinstance(observation, list) or len(observation) != 4:
+            return False
+        kind, grid_x, grid_y, count = observation
+        return (
+            kind in ("free", "wall")
+            and self.is_valid_cell([grid_x, grid_y])
+            and isinstance(count, int)
+            and count > 0
+        )
+
+    def mark_free(self, grid_x, grid_y):
+        """Apply enough free evidence to support older map updates."""
+        if self.data[grid_y][grid_x] == GRID_WALL:
+            return False
+        score = min(self.scores[grid_y][grid_x], FREE_SCORE_THRESHOLD)
+        return self.set_cell_score(grid_x, grid_y, score)
 
     def mark_wall(self, grid_x, grid_y):
-        """Mark one cell as wall. Walls override previous free readings."""
-        current_value = self.data[grid_y][grid_x]
-        if current_value == GRID_WALL:
+        """Apply enough wall evidence to support older map updates."""
+        score = max(self.scores[grid_y][grid_x], WALL_SCORE_THRESHOLD)
+        return self.set_cell_score(grid_x, grid_y, score)
+
+    def add_cell_evidence(self, grid_x, grid_y, evidence):
+        """Update one cell's score and public map state."""
+        old_score = self.scores[grid_y][grid_x]
+        new_score = max(
+            MIN_OCCUPANCY_SCORE,
+            min(MAX_OCCUPANCY_SCORE, old_score + evidence),
+        )
+        return self.set_cell_score(grid_x, grid_y, new_score)
+
+    def set_cell_score(self, grid_x, grid_y, new_score):
+        """Set one score directly and refresh its public map state."""
+        old_state = self.data[grid_y][grid_x]
+        self.scores[grid_y][grid_x] = new_score
+
+        if new_score >= WALL_SCORE_THRESHOLD:
+            new_state = GRID_WALL
+        elif new_score <= FREE_SCORE_THRESHOLD:
+            new_state = GRID_FREE
+        else:
+            new_state = GRID_UNKNOWN
+
+        if new_state == old_state:
             return False
 
-        if current_value == GRID_FREE:
+        if old_state == GRID_FREE:
             self.free_cell_count -= 1
+        elif old_state == GRID_WALL:
+            self.wall_cell_count -= 1
 
-        self.data[grid_y][grid_x] = GRID_WALL
-        self.wall_cell_count += 1
+        if new_state == GRID_FREE:
+            self.free_cell_count += 1
+        elif new_state == GRID_WALL:
+            self.wall_cell_count += 1
+
+        self.data[grid_y][grid_x] = new_state
         return True
 
     def merge_update(self, map_update):
@@ -138,6 +197,56 @@ class GlobalOccupancyGrid:
 
         new_free_cells = 0
         new_wall_cells = 0
+        if "observations" in map_update:
+            for observation in map_update.get("observations", []):
+                if not self.is_valid_ordered_observation(observation):
+                    continue
+
+                kind, grid_x, grid_y, count = observation
+                if kind == "free":
+                    evidence = FREE_EVIDENCE * count
+                else:
+                    evidence = WALL_EVIDENCE * count
+
+                if self.add_cell_evidence(grid_x, grid_y, evidence):
+                    if self.data[grid_y][grid_x] == GRID_FREE:
+                        new_free_cells += 1
+                    elif self.data[grid_y][grid_x] == GRID_WALL:
+                        new_wall_cells += 1
+
+            return new_free_cells, new_wall_cells
+
+        has_observations = (
+            "free_observations" in map_update
+            or "wall_observations" in map_update
+        )
+        if has_observations:
+            for observation in map_update.get("free_observations", []):
+                if not self.is_valid_observation(observation):
+                    continue
+
+                grid_x, grid_y, count = observation
+                evidence = FREE_EVIDENCE * count
+                if self.add_cell_evidence(grid_x, grid_y, evidence):
+                    if self.data[grid_y][grid_x] == GRID_FREE:
+                        new_free_cells += 1
+                    elif self.data[grid_y][grid_x] == GRID_WALL:
+                        new_wall_cells += 1
+
+            for observation in map_update.get("wall_observations", []):
+                if not self.is_valid_observation(observation):
+                    continue
+
+                grid_x, grid_y, count = observation
+                evidence = WALL_EVIDENCE * count
+                if self.add_cell_evidence(grid_x, grid_y, evidence):
+                    if self.data[grid_y][grid_x] == GRID_FREE:
+                        new_free_cells += 1
+                    elif self.data[grid_y][grid_x] == GRID_WALL:
+                        new_wall_cells += 1
+
+            return new_free_cells, new_wall_cells
+
         for cell in map_update.get("free_cells", []):
             if not self.is_valid_cell(cell):
                 continue

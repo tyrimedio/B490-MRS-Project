@@ -86,6 +86,12 @@ AXLE_LENGTH_M = 0.053
 GRID_UNKNOWN = -1
 GRID_FREE = 0
 GRID_WALL = 1
+FREE_EVIDENCE = -1
+WALL_EVIDENCE = 3
+MIN_OCCUPANCY_SCORE = -8
+MAX_OCCUPANCY_SCORE = 8
+FREE_SCORE_THRESHOLD = -2
+WALL_SCORE_THRESHOLD = 3
 CONTROLLER_BUILD = "2026-04-10-log-throttle-v4"
 
 
@@ -93,8 +99,9 @@ class OccupancyGrid:
     """
     Small 2D map stored as a grid (like graph paper).
 
-    Each cell starts as UNKNOWN and can later be marked FREE or WALL.
-    This class currently handles grid allocation and reset.
+    Each cell starts as UNKNOWN. Lidar readings add evidence to a score:
+    negative means probably open floor, positive means probably wall.
+    The public FREE/WALL/UNKNOWN state is recalculated from that score.
     """
 
     def __init__(self, world_size_m=6.0, cell_size_m=0.05):
@@ -103,10 +110,14 @@ class OccupancyGrid:
         self.width = int(round(world_size_m / cell_size_m))
         self.height = int(round(world_size_m / cell_size_m))
         self.data = []
+        self.scores = []
         self.wall_cell_count = 0
         self.free_cell_count = 0
         self.pending_free_cells = set()
         self.pending_wall_cells = set()
+        self.pending_free_observations = {}
+        self.pending_wall_observations = {}
+        self.pending_observations = []
         self.reset()
 
     def reset(self):
@@ -115,10 +126,17 @@ class OccupancyGrid:
             [GRID_UNKNOWN for _ in range(self.width)]
             for _ in range(self.height)
         ]
+        self.scores = [
+            [0 for _ in range(self.width)]
+            for _ in range(self.height)
+        ]
         self.wall_cell_count = 0
         self.free_cell_count = 0
         self.pending_free_cells = set()
         self.pending_wall_cells = set()
+        self.pending_free_observations = {}
+        self.pending_wall_observations = {}
+        self.pending_observations = []
 
     def world_to_grid(self, x_m, y_m):
         """Convert local map coordinates in meters to grid cell indices."""
@@ -139,30 +157,77 @@ class OccupancyGrid:
         return self.mark_wall_cell(grid_x, grid_y)
 
     def mark_wall_cell(self, grid_x, grid_y):
-        """Mark a grid cell as WALL using grid coordinates."""
-        current_value = self.data[grid_y][grid_x]
-        if current_value == GRID_WALL:
-            return False
-
-        if current_value == GRID_FREE:
-            self.free_cell_count -= 1
-
-        self.data[grid_y][grid_x] = GRID_WALL
-        self.wall_cell_count += 1
+        """Add wall evidence to a grid cell."""
         cell = (grid_x, grid_y)
-        self.pending_wall_cells.add(cell)
-        self.pending_free_cells.discard(cell)
-        return True
+        self.pending_wall_observations[cell] = (
+            self.pending_wall_observations.get(cell, 0) + 1
+        )
+        self.append_pending_observation("wall", grid_x, grid_y)
+        return self.add_cell_evidence(grid_x, grid_y, WALL_EVIDENCE)
 
     def mark_free_cell(self, grid_x, grid_y):
-        """Mark a grid cell as FREE unless it is already known to be a wall."""
-        current_value = self.data[grid_y][grid_x]
-        if current_value in (GRID_FREE, GRID_WALL):
+        """Add free-space evidence to a grid cell."""
+        cell = (grid_x, grid_y)
+        self.pending_free_observations[cell] = (
+            self.pending_free_observations.get(cell, 0) + 1
+        )
+        self.append_pending_observation("free", grid_x, grid_y)
+        return self.add_cell_evidence(grid_x, grid_y, FREE_EVIDENCE)
+
+    def append_pending_observation(self, kind, grid_x, grid_y):
+        """Remember evidence in the same order the robot observed it."""
+        if self.pending_observations:
+            last_kind, last_grid_x, last_grid_y, last_count = self.pending_observations[-1]
+            if last_kind == kind and last_grid_x == grid_x and last_grid_y == grid_y:
+                self.pending_observations[-1] = [
+                    last_kind,
+                    last_grid_x,
+                    last_grid_y,
+                    last_count + 1,
+                ]
+                return
+
+        self.pending_observations.append([kind, grid_x, grid_y, 1])
+
+    def add_cell_evidence(self, grid_x, grid_y, evidence):
+        """Update one cell's score and public map state."""
+        old_state = self.data[grid_y][grid_x]
+        old_score = self.scores[grid_y][grid_x]
+        new_score = clamp(
+            old_score + evidence,
+            MIN_OCCUPANCY_SCORE,
+            MAX_OCCUPANCY_SCORE,
+        )
+        self.scores[grid_y][grid_x] = new_score
+
+        if new_score >= WALL_SCORE_THRESHOLD:
+            new_state = GRID_WALL
+        elif new_score <= FREE_SCORE_THRESHOLD:
+            new_state = GRID_FREE
+        else:
+            new_state = GRID_UNKNOWN
+
+        if new_state == old_state:
             return False
 
-        self.data[grid_y][grid_x] = GRID_FREE
-        self.free_cell_count += 1
-        self.pending_free_cells.add((grid_x, grid_y))
+        if old_state == GRID_FREE:
+            self.free_cell_count -= 1
+        elif old_state == GRID_WALL:
+            self.wall_cell_count -= 1
+
+        if new_state == GRID_FREE:
+            self.free_cell_count += 1
+        elif new_state == GRID_WALL:
+            self.wall_cell_count += 1
+
+        self.data[grid_y][grid_x] = new_state
+        cell = (grid_x, grid_y)
+        self.pending_free_cells.discard(cell)
+        self.pending_wall_cells.discard(cell)
+        if new_state == GRID_FREE:
+            self.pending_free_cells.add(cell)
+        elif new_state == GRID_WALL:
+            self.pending_wall_cells.add(cell)
         return True
 
     def mark_free_line(self, start_x_m, start_y_m, end_x_m, end_y_m):
@@ -198,9 +263,21 @@ class OccupancyGrid:
         updates = {
             "free_cells": [list(cell) for cell in sorted(self.pending_free_cells)],
             "wall_cells": [list(cell) for cell in sorted(self.pending_wall_cells)],
+            "free_observations": [
+                [cell[0], cell[1], count]
+                for cell, count in sorted(self.pending_free_observations.items())
+            ],
+            "wall_observations": [
+                [cell[0], cell[1], count]
+                for cell, count in sorted(self.pending_wall_observations.items())
+            ],
+            "observations": list(self.pending_observations),
         }
         self.pending_free_cells.clear()
         self.pending_wall_cells.clear()
+        self.pending_free_observations.clear()
+        self.pending_wall_observations.clear()
+        self.pending_observations.clear()
         return updates
 
 

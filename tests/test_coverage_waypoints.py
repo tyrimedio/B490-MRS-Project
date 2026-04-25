@@ -349,6 +349,156 @@ class CoverageWaypointTests(unittest.TestCase):
         self.assertEqual("n_medium", task_command["room"])
         self.assertEqual("n_medium", plan_command["room"])
 
+    def test_robot_grid_uses_repeated_free_evidence(self):
+        controller = load_controller_module()
+        grid = controller.OccupancyGrid(world_size_m=1.0, cell_size_m=0.1)
+
+        self.assertFalse(grid.mark_free_cell(5, 5))
+        self.assertEqual(controller.GRID_UNKNOWN, grid.data[5][5])
+
+        self.assertTrue(grid.mark_free_cell(5, 5))
+        self.assertEqual(controller.GRID_FREE, grid.data[5][5])
+        self.assertEqual(1, grid.free_cell_count)
+
+    def test_robot_grid_wall_evidence_can_override_light_free_evidence(self):
+        controller = load_controller_module()
+        grid = controller.OccupancyGrid(world_size_m=1.0, cell_size_m=0.1)
+
+        grid.mark_free_cell(5, 5)
+        grid.mark_free_cell(5, 5)
+        self.assertEqual(controller.GRID_FREE, grid.data[5][5])
+
+        grid.mark_wall_cell(5, 5)
+        self.assertEqual(controller.GRID_UNKNOWN, grid.data[5][5])
+        self.assertEqual(0, grid.free_cell_count)
+        self.assertEqual(0, grid.wall_cell_count)
+
+        grid.mark_wall_cell(5, 5)
+        self.assertEqual(controller.GRID_WALL, grid.data[5][5])
+        self.assertEqual(1, grid.wall_cell_count)
+
+    def test_robot_grid_bad_wall_reading_can_be_recovered_by_free_evidence(self):
+        controller = load_controller_module()
+        grid = controller.OccupancyGrid(world_size_m=1.0, cell_size_m=0.1)
+
+        grid.mark_wall_cell(5, 5)
+        self.assertEqual(controller.GRID_WALL, grid.data[5][5])
+
+        for _ in range(5):
+            grid.mark_free_cell(5, 5)
+
+        self.assertEqual(controller.GRID_FREE, grid.data[5][5])
+        self.assertEqual(1, grid.free_cell_count)
+        self.assertEqual(0, grid.wall_cell_count)
+
+    def test_robot_grid_sends_observation_counts_with_legacy_cells(self):
+        controller = load_controller_module()
+        grid = controller.OccupancyGrid(world_size_m=1.0, cell_size_m=0.1)
+
+        grid.mark_free_cell(5, 5)
+        grid.mark_free_cell(5, 5)
+        grid.mark_wall_cell(6, 5)
+        updates = grid.drain_pending_updates()
+
+        self.assertEqual([[5, 5, 2]], updates["free_observations"])
+        self.assertEqual([[6, 5, 1]], updates["wall_observations"])
+        self.assertEqual([[5, 5]], updates["free_cells"])
+        self.assertEqual([[6, 5]], updates["wall_cells"])
+        self.assertEqual(
+            {
+                "free_cells": [],
+                "wall_cells": [],
+                "free_observations": [],
+                "wall_observations": [],
+                "observations": [],
+            },
+            grid.drain_pending_updates(),
+        )
+
+    def test_robot_grid_sends_observations_in_order(self):
+        controller = load_controller_module()
+        grid = controller.OccupancyGrid(world_size_m=1.0, cell_size_m=0.1)
+
+        for _ in range(3):
+            grid.mark_wall_cell(5, 5)
+        for _ in range(10):
+            grid.mark_free_cell(5, 5)
+        updates = grid.drain_pending_updates()
+
+        self.assertEqual(
+            [
+                ["wall", 5, 5, 3],
+                ["free", 5, 5, 10],
+            ],
+            updates["observations"],
+        )
+
+    def test_supervisor_grid_merges_confidence_observations(self):
+        supervisor = load_supervisor_module()
+        grid = supervisor.GlobalOccupancyGrid(world_size_m=1.0, cell_size_m=0.1)
+
+        free_count, wall_count = grid.merge_update(
+            {"free_observations": [[5, 5, 1]]}
+        )
+        self.assertEqual((0, 0), (free_count, wall_count))
+        self.assertEqual(supervisor.GRID_UNKNOWN, grid.data[5][5])
+
+        free_count, wall_count = grid.merge_update(
+            {"free_observations": [[5, 5, 1]]}
+        )
+        self.assertEqual((1, 0), (free_count, wall_count))
+        self.assertEqual(supervisor.GRID_FREE, grid.data[5][5])
+
+        free_count, wall_count = grid.merge_update(
+            {"wall_observations": [[5, 5, 2]]}
+        )
+        self.assertEqual((0, 1), (free_count, wall_count))
+        self.assertEqual(supervisor.GRID_WALL, grid.data[5][5])
+
+    def test_supervisor_ordered_observations_match_robot_clamped_score(self):
+        controller = load_controller_module()
+        supervisor = load_supervisor_module()
+        robot_grid = controller.OccupancyGrid(world_size_m=1.0, cell_size_m=0.1)
+        global_grid = supervisor.GlobalOccupancyGrid(world_size_m=1.0, cell_size_m=0.1)
+
+        for _ in range(3):
+            robot_grid.mark_wall_cell(5, 5)
+        for _ in range(10):
+            robot_grid.mark_free_cell(5, 5)
+
+        global_grid.merge_update(robot_grid.drain_pending_updates())
+
+        self.assertEqual(robot_grid.scores[5][5], global_grid.scores[5][5])
+        self.assertEqual(robot_grid.data[5][5], global_grid.data[5][5])
+        self.assertEqual(supervisor.GRID_FREE, global_grid.data[5][5])
+
+    def test_supervisor_grid_keeps_legacy_map_update_support(self):
+        supervisor = load_supervisor_module()
+        grid = supervisor.GlobalOccupancyGrid(world_size_m=1.0, cell_size_m=0.1)
+
+        free_count, wall_count = grid.merge_update(
+            {
+                "free_cells": [[5, 5]],
+                "wall_cells": [[6, 5]],
+            }
+        )
+
+        self.assertEqual((1, 1), (free_count, wall_count))
+        self.assertEqual(supervisor.GRID_FREE, grid.data[5][5])
+        self.assertEqual(supervisor.GRID_WALL, grid.data[5][6])
+
+    def test_supervisor_legacy_wall_update_still_overrides_free_cell(self):
+        supervisor = load_supervisor_module()
+        grid = supervisor.GlobalOccupancyGrid(world_size_m=1.0, cell_size_m=0.1)
+
+        grid.merge_update({"free_cells": [[5, 5]]})
+        free_count, wall_count = grid.merge_update({"wall_cells": [[5, 5]]})
+
+        self.assertEqual((0, 1), (free_count, wall_count))
+        self.assertEqual(supervisor.GRID_WALL, grid.data[5][5])
+        self.assertEqual(0, grid.free_cell_count)
+        self.assertEqual(1, grid.wall_cell_count)
+
 
 if __name__ == "__main__":
     unittest.main()
