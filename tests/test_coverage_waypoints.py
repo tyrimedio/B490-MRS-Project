@@ -100,6 +100,34 @@ class CoverageWaypointTests(unittest.TestCase):
             )
         )
 
+    def test_robot_holds_after_task_completion(self):
+        controller = load_controller_module()
+
+        self.assertTrue(
+            controller.should_hold_after_task(
+                assigned_target=(1.0, 1.0),
+                assignment_target_reached=True,
+                coverage_complete=True,
+            )
+        )
+        self.assertFalse(
+            controller.should_hold_after_task(
+                assigned_target=(1.0, 1.0),
+                assignment_target_reached=False,
+                coverage_complete=True,
+            )
+        )
+
+    def test_launch_waypoints_stage_robots_in_central_hub(self):
+        controller = load_controller_module()
+
+        for robot_name, waypoints in controller.ROBOT_LAUNCH_WAYPOINTS.items():
+            with self.subTest(robot=robot_name):
+                self.assertEqual(1, len(waypoints))
+                x_m, y_m = waypoints[0]
+                self.assertLessEqual(abs(x_m), 0.5)
+                self.assertLessEqual(abs(y_m), 0.5)
+
     def test_actual_robot_pose_uses_webots_translation(self):
         supervisor_module = load_supervisor_module()
 
@@ -183,15 +211,34 @@ class CoverageWaypointTests(unittest.TestCase):
         self.assertEqual(2, overlay.cleaned_tile_count("nw_small"))
         self.assertEqual(50.0, overlay.room_progress_percent("nw_small"))
 
-    def test_room_reached_coverage_goal_uses_percent_threshold(self):
+    def test_room_reached_coverage_goal_requires_no_dirty_tiles(self):
         supervisor = load_supervisor_module()
         overlay = supervisor.CleaningOverlay.__new__(supervisor.CleaningOverlay)
         overlay.room_tile_counts = {"nw_small": 20}
         overlay.dirty_tiles = {("nw_small", 0, 0)}
 
+        self.assertFalse(
+            supervisor.room_reached_coverage_goal(overlay, "nw_small")
+        )
+
+        overlay.dirty_tiles = set()
         self.assertTrue(
             supervisor.room_reached_coverage_goal(overlay, "nw_small")
         )
+
+    def test_dirty_tile_centers_targets_remaining_tiles(self):
+        supervisor = load_supervisor_module()
+        overlay = supervisor.CleaningOverlay.__new__(supervisor.CleaningOverlay)
+        overlay.rooms = supervisor.ROOM_TASKS
+        overlay.dirty_tiles = {
+            ("nw_small", 0, 0),
+            ("nw_small", 1, 0),
+            ("n_medium", 0, 0),
+        }
+
+        centers = overlay.dirty_tile_centers("nw_small")
+
+        self.assertEqual([[-2.875, 0.875], [-2.625, 0.875]], centers)
 
     def test_room_progress_snapshot_reports_every_room(self):
         supervisor = load_supervisor_module()
@@ -217,7 +264,7 @@ class CoverageWaypointTests(unittest.TestCase):
         self.assertIn("ne_large=70.0%", formatted)
         self.assertIn("nw_small=100.0%", formatted)
 
-    def test_reassignment_selects_least_clean_unfinished_room(self):
+    def test_reassignment_selects_least_supported_unfinished_room(self):
         supervisor = load_supervisor_module()
         overlay = supervisor.CleaningOverlay.__new__(supervisor.CleaningOverlay)
         overlay.room_tile_counts = {room: 20 for room in supervisor.ROOM_TASKS}
@@ -247,7 +294,7 @@ class CoverageWaypointTests(unittest.TestCase):
 
         self.assertEqual("n_medium", next_room)
 
-    def test_reassignment_skips_room_that_already_has_helper(self):
+    def test_reassignment_balances_helpers_before_progress(self):
         supervisor = load_supervisor_module()
         overlay = supervisor.CleaningOverlay.__new__(supervisor.CleaningOverlay)
         overlay.room_tile_counts = {room: 20 for room in supervisor.ROOM_TASKS}
@@ -269,6 +316,33 @@ class CoverageWaypointTests(unittest.TestCase):
             "epuck_1",
             room_assignments,
             {"nw_small"},
+            overlay,
+        )
+
+        self.assertEqual("ne_large", next_room)
+
+    def test_reassignment_can_join_room_that_already_has_helper(self):
+        supervisor = load_supervisor_module()
+        overlay = supervisor.CleaningOverlay.__new__(supervisor.CleaningOverlay)
+        overlay.room_tile_counts = {room: 20 for room in supervisor.ROOM_TASKS}
+        overlay.dirty_tiles = {
+            ("ne_large", col_index, 0)
+            for col_index in range(12)
+        } | {
+            ("sw_large", col_index, 0)
+            for col_index in range(10)
+        }
+        room_assignments = {
+            "epuck_1": {"room": "ne_large", "helper": True},
+            "epuck_2": {"room": "sw_large", "helper": True},
+            "epuck_3": {"room": "s_medium"},
+            "epuck_4": {"room": "se_small"},
+        }
+
+        next_room = supervisor.select_reassignment_room(
+            "epuck_3",
+            room_assignments,
+            {"nw_small", "n_medium", "s_medium", "se_small"},
             overlay,
         )
 
@@ -310,6 +384,23 @@ class CoverageWaypointTests(unittest.TestCase):
             3,
         )
         self.assertAlmostEqual(expected_cost, assignment["cost"])
+        self.assertEqual(
+            supervisor.generate_assignment_route(status["pose"], "ne_large"),
+            assignment["route"],
+        )
+
+    def test_assignment_route_leaves_current_room_through_doorway(self):
+        supervisor = load_supervisor_module()
+        pose = {"x_m": -2.85, "y_m": 2.2}
+
+        route = supervisor.generate_assignment_route(pose, "ne_large")
+
+        self.assertEqual([-2.25, 0.93], route[0])
+        self.assertEqual([-2.25, 0.57], route[1])
+        self.assertIn([0.0, 0.0], route)
+        self.assertEqual([1.85, 0.57], route[-3])
+        self.assertEqual([1.85, 0.93], route[-2])
+        self.assertEqual([1.85, 1.875], route[-1])
 
     def test_send_assignment_commands_targets_one_robot(self):
         supervisor = load_supervisor_module()
@@ -326,6 +417,7 @@ class CoverageWaypointTests(unittest.TestCase):
             "room": "n_medium",
             "target": supervisor.ROOM_TASKS["n_medium"]["center"],
             "cost": 0.5,
+            "route": [[0.0, 0.0], [-0.4, 0.57], [-0.4, 0.93], [-0.4, 1.875]],
         }
 
         coverage_plan = supervisor.send_assignment_commands(
@@ -348,6 +440,24 @@ class CoverageWaypointTests(unittest.TestCase):
         self.assertEqual("epuck_2", plan_command["robot"])
         self.assertEqual("n_medium", task_command["room"])
         self.assertEqual("n_medium", plan_command["room"])
+        self.assertEqual(assignment["route"], task_command["route"])
+
+    def test_send_idle_command_targets_one_robot(self):
+        supervisor = load_supervisor_module()
+
+        class FakeEmitter:
+            def __init__(self):
+                self.messages = []
+
+            def send(self, payload):
+                self.messages.append(payload)
+
+        emitter = FakeEmitter()
+        supervisor.send_idle_command(emitter, "epuck_4")
+
+        self.assertEqual(1, len(emitter.messages))
+        command = json.loads(emitter.messages[0])
+        self.assertEqual({"type": "idle", "robot": "epuck_4"}, command)
 
     def test_robot_grid_uses_repeated_free_evidence(self):
         controller = load_controller_module()

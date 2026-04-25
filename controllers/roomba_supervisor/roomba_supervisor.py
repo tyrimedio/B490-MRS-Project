@@ -26,7 +26,7 @@ MRTA_DISTANCE_WEIGHT = 1.0
 MRTA_AREA_WEIGHT = 0.05
 COVERAGE_MARGIN_M = 0.125
 COVERAGE_ROW_SPACING_M = 0.35
-COVERAGE_COMPLETE_PERCENT = 95.0
+COVERAGE_COMPLETE_PERCENT = 100.0
 CLEAN_TILE_SIZE_M = 0.25
 CLEAN_RADIUS_M = 0.18
 CLEAN_TRAIL_SAMPLE_SPACING_M = 0.08
@@ -44,6 +44,9 @@ MIN_OCCUPANCY_SCORE = -8
 MAX_OCCUPANCY_SCORE = 8
 FREE_SCORE_THRESHOLD = -2
 WALL_SCORE_THRESHOLD = 3
+HUB_ROUTE_WAYPOINT = [0.0, 0.0]
+ROOM_DOORWAY_INSIDE_OFFSET_M = 0.18
+ROOM_DOORWAY_HUB_OFFSET_M = 0.18
 
 ROOM_TASKS = {
     "nw_small": {
@@ -85,6 +88,79 @@ def normalize_angle(angle_rad):
     while angle_rad < -math.pi:
         angle_rad += 2.0 * math.pi
     return angle_rad
+
+
+def room_for_pose(pose):
+    """Return the room containing a pose, or None when the robot is outside rooms."""
+    if pose is None:
+        return None
+
+    x_m = pose.get("x_m")
+    y_m = pose.get("y_m")
+    if not isinstance(x_m, (int, float)) or not isinstance(y_m, (int, float)):
+        return None
+
+    for room, config in ROOM_TASKS.items():
+        min_x, max_x, min_y, max_y = config["bounds"]
+        if min_x <= x_m <= max_x and min_y <= y_m <= max_y:
+            return room
+    return None
+
+
+def room_doorway_waypoints(room):
+    """
+    Return doorway waypoints for entering or leaving a room.
+
+    The first point is just inside the room. The second is just outside the
+    room on the central hallway side. Driving through both keeps robots aimed
+    at the doorway instead of at a wall.
+    """
+    center_x_m, center_y_m = ROOM_TASKS[room]["center"]
+    _, _, min_y, max_y = ROOM_TASKS[room]["bounds"]
+    if center_y_m > 0.0:
+        wall_y_m = min_y
+        inside_y_m = wall_y_m + ROOM_DOORWAY_INSIDE_OFFSET_M
+        hub_y_m = wall_y_m - ROOM_DOORWAY_HUB_OFFSET_M
+    else:
+        wall_y_m = max_y
+        inside_y_m = wall_y_m - ROOM_DOORWAY_INSIDE_OFFSET_M
+        hub_y_m = wall_y_m + ROOM_DOORWAY_HUB_OFFSET_M
+
+    return [round(center_x_m, 3), round(inside_y_m, 3)], [
+        round(center_x_m, 3),
+        round(hub_y_m, 3),
+    ]
+
+
+def append_route_waypoint(route, waypoint):
+    """Append a route waypoint unless it repeats the previous point."""
+    if route and route[-1] == waypoint:
+        return
+    route.append(waypoint)
+
+
+def generate_assignment_route(pose, target_room):
+    """Build a doorway-aware route from the robot's current room to a target room."""
+    route = []
+    current_room = room_for_pose(pose)
+    target_x_m, target_y_m = ROOM_TASKS[target_room]["center"]
+    target_center = [round(target_x_m, 3), round(target_y_m, 3)]
+
+    if current_room == target_room:
+        return [target_center]
+
+    if current_room is not None and current_room != target_room:
+        current_inside, current_hub = room_doorway_waypoints(current_room)
+        append_route_waypoint(route, current_inside)
+        append_route_waypoint(route, current_hub)
+
+    append_route_waypoint(route, HUB_ROUTE_WAYPOINT)
+
+    target_inside, target_hub = room_doorway_waypoints(target_room)
+    append_route_waypoint(route, target_hub)
+    append_route_waypoint(route, target_inside)
+    append_route_waypoint(route, target_center)
+    return route
 
 
 class GlobalOccupancyGrid:
@@ -322,6 +398,10 @@ class TaskAllocator:
                     "room": room,
                     "cost": round(room_cost, 3),
                     "target": self.rooms[room]["center"],
+                    "route": generate_assignment_route(
+                        robot_statuses[robot]["pose"],
+                        room,
+                    ),
                 }
                 search(robot_index + 1, current_assignments, total_cost)
                 current_assignments.pop(robot)
@@ -546,10 +626,26 @@ class CleaningOverlay:
             return 0.0
         return 100.0 * self.cleaned_tile_count(room) / total_tiles
 
+    def dirty_tile_centers(self, room):
+        """Return center points for the dirty tiles that remain in one room."""
+        if room not in self.rooms:
+            return []
+
+        min_x, _, min_y, _ = self.rooms[room]["bounds"]
+        centers = []
+        for tile_room, col_index, row_index in sorted(self.dirty_tiles):
+            if tile_room != room:
+                continue
+            centers.append([
+                round(min_x + (col_index + 0.5) * CLEAN_TILE_SIZE_M, 3),
+                round(min_y + (row_index + 0.5) * CLEAN_TILE_SIZE_M, 3),
+            ])
+        return centers
+
 
 def room_reached_coverage_goal(cleaning_overlay, room):
-    """Return True when enough visible cleaning tiles are clean."""
-    return cleaning_overlay.room_progress_percent(room) >= COVERAGE_COMPLETE_PERCENT
+    """Return True when no visible cleaning tiles remain dirty."""
+    return cleaning_overlay.dirty_tile_count(room) == 0
 
 
 def room_progress_snapshot(cleaning_overlay):
@@ -578,32 +674,39 @@ def select_reassignment_room(
     Pick the unfinished room that most needs help.
 
     This is a simple dynamic MRTA step: when one robot finishes, it helps the
-    least-clean unfinished room instead of sitting idle.
+    least-supported unfinished room instead of sitting idle. When two rooms
+    have the same number of robots working on them, it picks the dirtier room.
     """
     current_assignment = room_assignments.get(robot_name)
     current_room = None
     if current_assignment is not None:
         current_room = current_assignment["room"]
 
-    helper_rooms = {
-        assignment["room"]
-        for robot, assignment in room_assignments.items()
-        if robot != robot_name and assignment.get("helper", False)
-    }
+    active_room_counts = {}
+    for robot, assignment in room_assignments.items():
+        if robot == robot_name or assignment is None:
+            continue
+        room = assignment["room"]
+        active_room_counts[room] = active_room_counts.get(room, 0) + 1
+
     candidate_rooms = []
     for room in ROOM_TASKS:
-        if room == current_room or room in completed_rooms or room in helper_rooms:
+        if room == current_room or room in completed_rooms:
             continue
         progress_percent = cleaning_overlay.room_progress_percent(room)
         if progress_percent >= COVERAGE_COMPLETE_PERCENT:
             continue
-        candidate_rooms.append((progress_percent, room))
+        candidate_rooms.append((
+            active_room_counts.get(room, 0),
+            progress_percent,
+            room,
+        ))
 
     if not candidate_rooms:
         return None
 
     candidate_rooms.sort()
-    return candidate_rooms[0][1]
+    return candidate_rooms[0][2]
 
 
 def build_assignment(robot_status, room, helper=False):
@@ -617,6 +720,7 @@ def build_assignment(robot_status, room, helper=False):
         "room": room,
         "cost": round(cost, 3),
         "target": ROOM_TASKS[room]["center"],
+        "route": generate_assignment_route(pose, room),
         "helper": helper,
     }
 
@@ -630,22 +734,41 @@ def send_assignment_commands(emitter, robot_name, assignment):
                 "robot": robot_name,
                 "room": assignment["room"],
                 "target": assignment["target"],
+                "route": assignment.get("route", [assignment["target"]]),
                 "cost": assignment["cost"],
             }
         )
     )
     coverage_plan = generate_coverage_waypoints(assignment["room"])
+    send_coverage_plan(emitter, robot_name, assignment["room"], coverage_plan)
+    return coverage_plan
+
+
+def send_coverage_plan(emitter, robot_name, room, coverage_plan):
+    """Send coverage waypoints to one robot."""
     emitter.send(
         json.dumps(
             {
                 "type": "coverage_plan",
                 "robot": robot_name,
-                "room": assignment["room"],
+                "room": room,
                 "waypoints": coverage_plan,
             }
         )
     )
     return coverage_plan
+
+
+def send_idle_command(emitter, robot_name):
+    """Tell one robot to stop and wait for a future assignment."""
+    emitter.send(
+        json.dumps(
+            {
+                "type": "idle",
+                "robot": robot_name,
+            }
+        )
+    )
 
 
 def run():
@@ -666,6 +789,7 @@ def run():
     last_cleaning_poses = {}
     room_assignments = {}
     coverage_plans = {}
+    cleanup_plan_signatures = {}
     completed_rooms = set()
     completed_robot_rooms = {}
     assignments_sent = False
@@ -789,9 +913,42 @@ def run():
                     continue
 
                 room = assignment["room"]
+                coverage = status.get("coverage", {})
+                coverage_done_for_room = (
+                    coverage.get("room") == room
+                    and coverage.get("complete", False)
+                )
+                if (
+                    coverage_done_for_room
+                    and not room_reached_coverage_goal(cleaning_overlay, room)
+                ):
+                    cleanup_plan = cleaning_overlay.dirty_tile_centers(room)
+                    cleanup_signature = (
+                        room,
+                        tuple(tuple(waypoint) for waypoint in cleanup_plan),
+                    )
+                    if (
+                        cleanup_plan
+                        and cleanup_plan_signatures.get(robot_name)
+                        != cleanup_signature
+                    ):
+                        coverage_plans[robot_name] = send_coverage_plan(
+                            emitter,
+                            robot_name,
+                            room,
+                            cleanup_plan,
+                        )
+                        cleanup_plan_signatures[robot_name] = cleanup_signature
+                        print(
+                            f"[supervisor] Sent {robot_name} cleanup pass for "
+                            f"{room}: {len(cleanup_plan)} dirty tile(s) remain"
+                        )
+                    continue
+
                 if not room_reached_coverage_goal(cleaning_overlay, room):
                     continue
 
+                cleanup_plan_signatures.pop(robot_name, None)
                 if room not in completed_rooms:
                     completed_rooms.add(room)
                     print(
@@ -810,6 +967,11 @@ def run():
                     cleaning_overlay,
                 )
                 if next_room is None:
+                    send_idle_command(emitter, robot_name)
+                    room_assignments[robot_name] = None
+                    coverage_plans[robot_name] = []
+                    cleanup_plan_signatures.pop(robot_name, None)
+                    last_cleaning_poses.pop(robot_name, None)
                     print(f"[supervisor] {robot_name} has no unfinished room to help")
                     continue
 
@@ -821,6 +983,7 @@ def run():
                     robot_name,
                     next_assignment,
                 )
+                cleanup_plan_signatures.pop(robot_name, None)
                 last_cleaning_poses.pop(robot_name, None)
                 print(
                     f"[supervisor] Reassigned {robot_name} to help {next_room}; "

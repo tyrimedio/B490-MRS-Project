@@ -47,14 +47,14 @@ ROBOT_START_POSES = {
     "epuck_4": (1.5, 0.0, -0.5 * math.pi),
 }
 
-# Launch carries each robot from its spawn position to the doorway threshold
-# of a nearby room and then stops. Robots wait there for the supervisor's
-# real task assignment instead of committing to a specific room up front.
+# Launch carries each robot to a small staging point inside the central hub.
+# Robots wait there for the supervisor's real task assignment instead of
+# drifting toward a room before MRTA has made that choice.
 ROBOT_LAUNCH_WAYPOINTS = {
-    "epuck_1": ((-2.25, 0.4),),
-    "epuck_2": ((-0.4, 0.4),),
-    "epuck_3": ((0.4, -0.4),),
-    "epuck_4": ((2.25, -0.4),),
+    "epuck_1": ((-0.35, 0.30),),
+    "epuck_2": ((-0.12, 0.15),),
+    "epuck_3": ((0.12, -0.15),),
+    "epuck_4": ((0.35, -0.30),),
 }
 DEFAULT_START_POSE = (0.0, 0.0, 0.0)
 DEFAULT_LAUNCH_WAYPOINTS = ()
@@ -331,6 +331,15 @@ def should_hold_for_assignment(launch_finished, launch_timed_out, assigned_targe
     return (launch_finished or launch_timed_out) and assigned_target is None
 
 
+def should_hold_after_task(assigned_target, assignment_target_reached, coverage_complete):
+    """Return whether the robot should wait after its active plan is done."""
+    return (
+        assigned_target is not None
+        and assignment_target_reached
+        and coverage_complete
+    )
+
+
 def run():
     robot = Robot()
     timestep = int(robot.getBasicTimeStep())
@@ -413,6 +422,8 @@ def run():
     launch_timed_out = False
     assigned_room = None
     assigned_target = None
+    assignment_route = []
+    assignment_route_index = 0
     assignment_target_reached = False
     coverage_room = None
     coverage_waypoints = []
@@ -475,14 +486,39 @@ def run():
                         target = command_message.get("target")
                         if isinstance(target, list) and len(target) == 2:
                             assigned_target = (float(target[0]), float(target[1]))
+                            assignment_route = []
+                            for waypoint in command_message.get("route", []):
+                                if isinstance(waypoint, list) and len(waypoint) == 2:
+                                    assignment_route.append(
+                                        (float(waypoint[0]), float(waypoint[1]))
+                                    )
+                            if not assignment_route:
+                                assignment_route = [assigned_target]
+                            assignment_route_index = 0
                             assignment_target_reached = False
                         else:
                             assigned_target = None
+                            assignment_route = []
+                            assignment_route_index = 0
                             assignment_target_reached = False
                         print(
                             f"[{robot_name}] Assigned to room "
-                            f"{assigned_room}"
+                            f"{assigned_room} via {len(assignment_route)} "
+                            "route waypoint(s)"
                         )
+                elif command_message.get("type") == "idle":
+                    target_robot = command_message.get("robot")
+                    if target_robot in (robot_name, "all"):
+                        assigned_room = None
+                        assigned_target = None
+                        assignment_route = []
+                        assignment_route_index = 0
+                        assignment_target_reached = False
+                        coverage_room = None
+                        coverage_waypoints = []
+                        coverage_waypoint_index = 0
+                        coverage_complete = True
+                        print(f"[{robot_name}] Holding idle")
                 elif command_message.get("type") == "coverage_plan":
                     target_robot = command_message.get("robot")
                     if target_robot in (robot_name, "all"):
@@ -642,17 +678,25 @@ def run():
         launch_finished = launch_waypoint_index >= len(launch_waypoints)
         if (
             assigned_target is not None
+            and assignment_route_index < len(assignment_route)
             and not assignment_target_reached
             and (launch_finished or launch_timed_out)
         ):
-            target_x_m, target_y_m = assigned_target
+            target_x_m, target_y_m = assignment_route[assignment_route_index]
             delta_x_m = target_x_m - robot_x_m
             delta_y_m = target_y_m - robot_y_m
             target_distance_m = math.hypot(delta_x_m, delta_y_m)
 
             if target_distance_m <= ASSIGNMENT_TARGET_REACHED_M:
-                assignment_target_reached = True
-                print(f"[{robot_name}] Reached assigned room {assigned_room}")
+                assignment_route_index += 1
+                if assignment_route_index >= len(assignment_route):
+                    assignment_target_reached = True
+                    print(f"[{robot_name}] Reached assigned room {assigned_room}")
+                else:
+                    print(
+                        f"[{robot_name}] Assignment route waypoint "
+                        f"{assignment_route_index}/{len(assignment_route)} reached"
+                    )
             else:
                 assignment_left_speed, assignment_right_speed = drive_toward_target(
                     robot_x_m,
@@ -713,6 +757,14 @@ def run():
         # Decide motor speeds based on the highest-priority active behavior.
         if should_hold_for_assignment(launch_finished, launch_timed_out, assigned_target):
             # Hold position while waiting for the supervisor to assign a room.
+            left_speed = 0.0
+            right_speed = 0.0
+        elif should_hold_after_task(
+            assigned_target,
+            assignment_target_reached,
+            coverage_complete,
+        ):
+            # Hold position after finishing the current room until reassigned.
             left_speed = 0.0
             right_speed = 0.0
         elif escape_reverse_steps > 0 and not rear_blocked:
@@ -807,6 +859,10 @@ def run():
                 "mapping_enabled": mapping_enabled,
                 "assigned_room": assigned_room,
                 "assignment_target_reached": assignment_target_reached,
+                "assignment_route": {
+                    "waypoint_index": assignment_route_index,
+                    "waypoint_count": len(assignment_route),
+                },
                 "coverage": {
                     "room": coverage_room,
                     "waypoint_index": coverage_waypoint_index,
