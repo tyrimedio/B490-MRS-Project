@@ -47,14 +47,14 @@ ROBOT_START_POSES = {
     "epuck_4": (1.5, 0.0, -0.5 * math.pi),
 }
 
-# Launch carries each robot from its spawn position to the doorway threshold
-# of a nearby room and then stops. Robots wait there for the supervisor's
-# real task assignment instead of committing to a specific room up front.
+# Launch carries each robot to a small staging point inside the central hub.
+# Robots wait there for the supervisor's real task assignment instead of
+# drifting toward a room before MRTA has made that choice.
 ROBOT_LAUNCH_WAYPOINTS = {
-    "epuck_1": ((-2.25, 0.4),),
-    "epuck_2": ((-0.4, 0.4),),
-    "epuck_3": ((0.4, -0.4),),
-    "epuck_4": ((2.25, -0.4),),
+    "epuck_1": ((-0.35, 0.30),),
+    "epuck_2": ((-0.12, 0.15),),
+    "epuck_3": ((0.12, -0.15),),
+    "epuck_4": ((0.35, -0.30),),
 }
 DEFAULT_START_POSE = (0.0, 0.0, 0.0)
 DEFAULT_LAUNCH_WAYPOINTS = ()
@@ -86,6 +86,12 @@ AXLE_LENGTH_M = 0.053
 GRID_UNKNOWN = -1
 GRID_FREE = 0
 GRID_WALL = 1
+FREE_EVIDENCE = -1
+WALL_EVIDENCE = 3
+MIN_OCCUPANCY_SCORE = -8
+MAX_OCCUPANCY_SCORE = 8
+FREE_SCORE_THRESHOLD = -2
+WALL_SCORE_THRESHOLD = 3
 CONTROLLER_BUILD = "2026-04-10-log-throttle-v4"
 
 
@@ -93,8 +99,9 @@ class OccupancyGrid:
     """
     Small 2D map stored as a grid (like graph paper).
 
-    Each cell starts as UNKNOWN and can later be marked FREE or WALL.
-    This class currently handles grid allocation and reset.
+    Each cell starts as UNKNOWN. Lidar readings add evidence to a score:
+    negative means probably open floor, positive means probably wall.
+    The public FREE/WALL/UNKNOWN state is recalculated from that score.
     """
 
     def __init__(self, world_size_m=6.0, cell_size_m=0.05):
@@ -103,10 +110,14 @@ class OccupancyGrid:
         self.width = int(round(world_size_m / cell_size_m))
         self.height = int(round(world_size_m / cell_size_m))
         self.data = []
+        self.scores = []
         self.wall_cell_count = 0
         self.free_cell_count = 0
         self.pending_free_cells = set()
         self.pending_wall_cells = set()
+        self.pending_free_observations = {}
+        self.pending_wall_observations = {}
+        self.pending_observations = []
         self.reset()
 
     def reset(self):
@@ -115,10 +126,17 @@ class OccupancyGrid:
             [GRID_UNKNOWN for _ in range(self.width)]
             for _ in range(self.height)
         ]
+        self.scores = [
+            [0 for _ in range(self.width)]
+            for _ in range(self.height)
+        ]
         self.wall_cell_count = 0
         self.free_cell_count = 0
         self.pending_free_cells = set()
         self.pending_wall_cells = set()
+        self.pending_free_observations = {}
+        self.pending_wall_observations = {}
+        self.pending_observations = []
 
     def world_to_grid(self, x_m, y_m):
         """Convert local map coordinates in meters to grid cell indices."""
@@ -139,30 +157,77 @@ class OccupancyGrid:
         return self.mark_wall_cell(grid_x, grid_y)
 
     def mark_wall_cell(self, grid_x, grid_y):
-        """Mark a grid cell as WALL using grid coordinates."""
-        current_value = self.data[grid_y][grid_x]
-        if current_value == GRID_WALL:
-            return False
-
-        if current_value == GRID_FREE:
-            self.free_cell_count -= 1
-
-        self.data[grid_y][grid_x] = GRID_WALL
-        self.wall_cell_count += 1
+        """Add wall evidence to a grid cell."""
         cell = (grid_x, grid_y)
-        self.pending_wall_cells.add(cell)
-        self.pending_free_cells.discard(cell)
-        return True
+        self.pending_wall_observations[cell] = (
+            self.pending_wall_observations.get(cell, 0) + 1
+        )
+        self.append_pending_observation("wall", grid_x, grid_y)
+        return self.add_cell_evidence(grid_x, grid_y, WALL_EVIDENCE)
 
     def mark_free_cell(self, grid_x, grid_y):
-        """Mark a grid cell as FREE unless it is already known to be a wall."""
-        current_value = self.data[grid_y][grid_x]
-        if current_value in (GRID_FREE, GRID_WALL):
+        """Add free-space evidence to a grid cell."""
+        cell = (grid_x, grid_y)
+        self.pending_free_observations[cell] = (
+            self.pending_free_observations.get(cell, 0) + 1
+        )
+        self.append_pending_observation("free", grid_x, grid_y)
+        return self.add_cell_evidence(grid_x, grid_y, FREE_EVIDENCE)
+
+    def append_pending_observation(self, kind, grid_x, grid_y):
+        """Remember evidence in the same order the robot observed it."""
+        if self.pending_observations:
+            last_kind, last_grid_x, last_grid_y, last_count = self.pending_observations[-1]
+            if last_kind == kind and last_grid_x == grid_x and last_grid_y == grid_y:
+                self.pending_observations[-1] = [
+                    last_kind,
+                    last_grid_x,
+                    last_grid_y,
+                    last_count + 1,
+                ]
+                return
+
+        self.pending_observations.append([kind, grid_x, grid_y, 1])
+
+    def add_cell_evidence(self, grid_x, grid_y, evidence):
+        """Update one cell's score and public map state."""
+        old_state = self.data[grid_y][grid_x]
+        old_score = self.scores[grid_y][grid_x]
+        new_score = clamp(
+            old_score + evidence,
+            MIN_OCCUPANCY_SCORE,
+            MAX_OCCUPANCY_SCORE,
+        )
+        self.scores[grid_y][grid_x] = new_score
+
+        if new_score >= WALL_SCORE_THRESHOLD:
+            new_state = GRID_WALL
+        elif new_score <= FREE_SCORE_THRESHOLD:
+            new_state = GRID_FREE
+        else:
+            new_state = GRID_UNKNOWN
+
+        if new_state == old_state:
             return False
 
-        self.data[grid_y][grid_x] = GRID_FREE
-        self.free_cell_count += 1
-        self.pending_free_cells.add((grid_x, grid_y))
+        if old_state == GRID_FREE:
+            self.free_cell_count -= 1
+        elif old_state == GRID_WALL:
+            self.wall_cell_count -= 1
+
+        if new_state == GRID_FREE:
+            self.free_cell_count += 1
+        elif new_state == GRID_WALL:
+            self.wall_cell_count += 1
+
+        self.data[grid_y][grid_x] = new_state
+        cell = (grid_x, grid_y)
+        self.pending_free_cells.discard(cell)
+        self.pending_wall_cells.discard(cell)
+        if new_state == GRID_FREE:
+            self.pending_free_cells.add(cell)
+        elif new_state == GRID_WALL:
+            self.pending_wall_cells.add(cell)
         return True
 
     def mark_free_line(self, start_x_m, start_y_m, end_x_m, end_y_m):
@@ -198,9 +263,21 @@ class OccupancyGrid:
         updates = {
             "free_cells": [list(cell) for cell in sorted(self.pending_free_cells)],
             "wall_cells": [list(cell) for cell in sorted(self.pending_wall_cells)],
+            "free_observations": [
+                [cell[0], cell[1], count]
+                for cell, count in sorted(self.pending_free_observations.items())
+            ],
+            "wall_observations": [
+                [cell[0], cell[1], count]
+                for cell, count in sorted(self.pending_wall_observations.items())
+            ],
+            "observations": list(self.pending_observations),
         }
         self.pending_free_cells.clear()
         self.pending_wall_cells.clear()
+        self.pending_free_observations.clear()
+        self.pending_wall_observations.clear()
+        self.pending_observations.clear()
         return updates
 
 
@@ -252,6 +329,15 @@ def drive_toward_target(robot_x_m, robot_y_m, robot_theta_rad, target_x_m, targe
 def should_hold_for_assignment(launch_finished, launch_timed_out, assigned_target):
     """Return whether the robot should wait at launch staging."""
     return (launch_finished or launch_timed_out) and assigned_target is None
+
+
+def should_hold_after_task(assigned_target, assignment_target_reached, coverage_complete):
+    """Return whether the robot should wait after its active plan is done."""
+    return (
+        assigned_target is not None
+        and assignment_target_reached
+        and coverage_complete
+    )
 
 
 def run():
@@ -336,6 +422,8 @@ def run():
     launch_timed_out = False
     assigned_room = None
     assigned_target = None
+    assignment_route = []
+    assignment_route_index = 0
     assignment_target_reached = False
     coverage_room = None
     coverage_waypoints = []
@@ -398,14 +486,39 @@ def run():
                         target = command_message.get("target")
                         if isinstance(target, list) and len(target) == 2:
                             assigned_target = (float(target[0]), float(target[1]))
+                            assignment_route = []
+                            for waypoint in command_message.get("route", []):
+                                if isinstance(waypoint, list) and len(waypoint) == 2:
+                                    assignment_route.append(
+                                        (float(waypoint[0]), float(waypoint[1]))
+                                    )
+                            if not assignment_route:
+                                assignment_route = [assigned_target]
+                            assignment_route_index = 0
                             assignment_target_reached = False
                         else:
                             assigned_target = None
+                            assignment_route = []
+                            assignment_route_index = 0
                             assignment_target_reached = False
                         print(
                             f"[{robot_name}] Assigned to room "
-                            f"{assigned_room}"
+                            f"{assigned_room} via {len(assignment_route)} "
+                            "route waypoint(s)"
                         )
+                elif command_message.get("type") == "idle":
+                    target_robot = command_message.get("robot")
+                    if target_robot in (robot_name, "all"):
+                        assigned_room = None
+                        assigned_target = None
+                        assignment_route = []
+                        assignment_route_index = 0
+                        assignment_target_reached = False
+                        coverage_room = None
+                        coverage_waypoints = []
+                        coverage_waypoint_index = 0
+                        coverage_complete = True
+                        print(f"[{robot_name}] Holding idle")
                 elif command_message.get("type") == "coverage_plan":
                     target_robot = command_message.get("robot")
                     if target_robot in (robot_name, "all"):
@@ -565,17 +678,25 @@ def run():
         launch_finished = launch_waypoint_index >= len(launch_waypoints)
         if (
             assigned_target is not None
+            and assignment_route_index < len(assignment_route)
             and not assignment_target_reached
             and (launch_finished or launch_timed_out)
         ):
-            target_x_m, target_y_m = assigned_target
+            target_x_m, target_y_m = assignment_route[assignment_route_index]
             delta_x_m = target_x_m - robot_x_m
             delta_y_m = target_y_m - robot_y_m
             target_distance_m = math.hypot(delta_x_m, delta_y_m)
 
             if target_distance_m <= ASSIGNMENT_TARGET_REACHED_M:
-                assignment_target_reached = True
-                print(f"[{robot_name}] Reached assigned room {assigned_room}")
+                assignment_route_index += 1
+                if assignment_route_index >= len(assignment_route):
+                    assignment_target_reached = True
+                    print(f"[{robot_name}] Reached assigned room {assigned_room}")
+                else:
+                    print(
+                        f"[{robot_name}] Assignment route waypoint "
+                        f"{assignment_route_index}/{len(assignment_route)} reached"
+                    )
             else:
                 assignment_left_speed, assignment_right_speed = drive_toward_target(
                     robot_x_m,
@@ -636,6 +757,14 @@ def run():
         # Decide motor speeds based on the highest-priority active behavior.
         if should_hold_for_assignment(launch_finished, launch_timed_out, assigned_target):
             # Hold position while waiting for the supervisor to assign a room.
+            left_speed = 0.0
+            right_speed = 0.0
+        elif should_hold_after_task(
+            assigned_target,
+            assignment_target_reached,
+            coverage_complete,
+        ):
+            # Hold position after finishing the current room until reassigned.
             left_speed = 0.0
             right_speed = 0.0
         elif escape_reverse_steps > 0 and not rear_blocked:
@@ -730,6 +859,10 @@ def run():
                 "mapping_enabled": mapping_enabled,
                 "assigned_room": assigned_room,
                 "assignment_target_reached": assignment_target_reached,
+                "assignment_route": {
+                    "waypoint_index": assignment_route_index,
+                    "waypoint_count": len(assignment_route),
+                },
                 "coverage": {
                     "room": coverage_room,
                     "waypoint_index": coverage_waypoint_index,
