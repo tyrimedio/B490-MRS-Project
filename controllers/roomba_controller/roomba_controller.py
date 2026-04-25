@@ -41,20 +41,20 @@ POSE_CORRECTION_LOG_INTERVAL_STEPS = 120
 # Initial Webots poses for the four robots in the shared world frame.
 # These match the robot translations and rotations in worlds/roomba_cluster.wbt.
 ROBOT_START_POSES = {
-    "epuck_1": (0.0, 0.28, 0.5 * math.pi),
-    "epuck_2": (0.28, 0.0, 0.0),
-    "epuck_3": (0.0, -0.28, -0.5 * math.pi),
-    "epuck_4": (-0.28, 0.0, math.pi),
+    "epuck_1": (-1.5, 0.0, 0.5 * math.pi),
+    "epuck_2": (-0.5, 0.0, 0.5 * math.pi),
+    "epuck_3": (0.5, 0.0, -0.5 * math.pi),
+    "epuck_4": (1.5, 0.0, -0.5 * math.pi),
 }
 
-# Launch behavior from hub to room (world-frame waypoints in meters).
-# Each robot exits the central hub through a different doorway, then moves
-# toward the middle of its assigned corner room.
+# Launch behavior from the hub corridor into the initial preview room
+# (world-frame waypoints in meters). The first waypoint lines the robot up
+# under its doorway; the second drops it into the room center.
 ROBOT_LAUNCH_WAYPOINTS = {
-    "epuck_1": ((0.0, 1.75), (-1.75, 1.75)),     # northwest room
-    "epuck_2": ((1.75, 0.0), (1.75, 1.75)),      # northeast room
-    "epuck_3": ((0.0, -1.75), (1.75, -1.75)),    # southeast room
-    "epuck_4": ((-1.75, 0.0), (-1.75, -1.75)),   # southwest room
+    "epuck_1": ((-2.25, 0.4), (-2.25, 1.875)),   # nw_small
+    "epuck_2": ((-0.4, 0.4), (-0.4, 1.875)),     # n_medium
+    "epuck_3": ((0.4, -0.4), (0.4, -1.875)),     # s_medium
+    "epuck_4": ((2.25, -0.4), (2.25, -1.875)),   # se_small
 }
 DEFAULT_START_POSE = (0.0, 0.0, 0.0)
 DEFAULT_LAUNCH_WAYPOINTS = ()

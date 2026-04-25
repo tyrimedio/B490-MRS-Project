@@ -41,33 +41,46 @@ GRID_FREE = 0
 GRID_WALL = 1
 
 ROOM_TASKS = {
-    "northwest": {
-        "center": (-1.75, 1.75),
-        "bounds": (-3.0, -0.5, 0.5, 3.0),
-        "area_m2": 2.5 * 2.5,
+    "nw_small": {
+        "center": (-2.25, 1.875),
+        "bounds": (-3.0, -1.5, 0.75, 3.0),
+        "area_m2": 1.5 * 2.25,
     },
-    "northeast": {
-        "center": (1.75, 1.75),
-        "bounds": (0.5, 3.0, 0.5, 3.0),
-        "area_m2": 2.5 * 2.5,
+    "n_medium": {
+        "center": (-0.4, 1.875),
+        "bounds": (-1.5, 0.7, 0.75, 3.0),
+        "area_m2": 2.2 * 2.25,
     },
-    "southeast": {
-        "center": (1.75, -1.75),
-        "bounds": (0.5, 3.0, -3.0, -0.5),
-        "area_m2": 2.5 * 2.5,
+    "ne_large": {
+        "center": (1.85, 1.875),
+        "bounds": (0.7, 3.0, 0.75, 3.0),
+        "area_m2": 2.3 * 2.25,
     },
-    "southwest": {
-        "center": (-1.75, -1.75),
-        "bounds": (-3.0, -0.5, -3.0, -0.5),
-        "area_m2": 2.5 * 2.5,
+    "sw_large": {
+        "center": (-1.85, -1.875),
+        "bounds": (-3.0, -0.7, -3.0, -0.75),
+        "area_m2": 2.3 * 2.25,
+    },
+    "s_medium": {
+        "center": (0.4, -1.875),
+        "bounds": (-0.7, 1.5, -3.0, -0.75),
+        "area_m2": 2.2 * 2.25,
+    },
+    "se_small": {
+        "center": (2.25, -1.875),
+        "bounds": (1.5, 3.0, -3.0, -0.75),
+        "area_m2": 1.5 * 2.25,
     },
 }
 
+# Initial visual preview before MRTA runs. With more rooms than robots, the
+# two large rooms are intentionally left out of the preview so the MRTA
+# reassignment step has unfinished rooms to redirect free robots toward.
 ROOM_ASSIGNMENT_PREVIEW = {
-    "epuck_1": "northwest",
-    "epuck_2": "northeast",
-    "epuck_3": "southeast",
-    "epuck_4": "southwest",
+    "epuck_1": "nw_small",
+    "epuck_2": "n_medium",
+    "epuck_3": "s_medium",
+    "epuck_4": "se_small",
 }
 
 
@@ -184,7 +197,7 @@ class TaskAllocator:
         """Return room assignments that minimize total cost for this small team."""
         robots = [robot for robot in EXPECTED_ROBOTS if robot in robot_statuses]
         rooms = list(self.rooms)
-        if len(robots) != len(rooms):
+        if not robots or len(robots) > len(rooms):
             return {}
 
         best_assignments = None
