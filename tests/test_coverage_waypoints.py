@@ -146,147 +146,122 @@ class CoverageWaypointTests(unittest.TestCase):
     def test_room_progress_percent_uses_dirty_tiles(self):
         supervisor = load_supervisor_module()
         overlay = supervisor.CleaningOverlay.__new__(supervisor.CleaningOverlay)
-        overlay.room_tile_counts = {"northwest": 4}
+        overlay.room_tile_counts = {"nw_small": 4}
         overlay.dirty_tiles = {
-            ("northwest", 0, 0),
-            ("northwest", 1, 0),
+            ("nw_small", 0, 0),
+            ("nw_small", 1, 0),
         }
 
-        self.assertEqual(2, overlay.cleaned_tile_count("northwest"))
-        self.assertEqual(50.0, overlay.room_progress_percent("northwest"))
+        self.assertEqual(2, overlay.cleaned_tile_count("nw_small"))
+        self.assertEqual(50.0, overlay.room_progress_percent("nw_small"))
 
     def test_room_reached_coverage_goal_uses_percent_threshold(self):
         supervisor = load_supervisor_module()
         overlay = supervisor.CleaningOverlay.__new__(supervisor.CleaningOverlay)
-        overlay.room_tile_counts = {"northwest": 20}
-        overlay.dirty_tiles = {("northwest", 0, 0)}
+        overlay.room_tile_counts = {"nw_small": 20}
+        overlay.dirty_tiles = {("nw_small", 0, 0)}
 
         self.assertTrue(
-            supervisor.room_reached_coverage_goal(overlay, "northwest")
+            supervisor.room_reached_coverage_goal(overlay, "nw_small")
         )
 
     def test_room_progress_snapshot_reports_every_room(self):
         supervisor = load_supervisor_module()
         overlay = supervisor.CleaningOverlay.__new__(supervisor.CleaningOverlay)
-        overlay.room_tile_counts = {
-            "northwest": 10,
-            "northeast": 10,
-            "southeast": 10,
-            "southwest": 10,
-        }
+        overlay.room_tile_counts = {room: 10 for room in supervisor.ROOM_TASKS}
         overlay.dirty_tiles = {
-            ("northwest", 0, 0),
-            ("northeast", 0, 0),
-            ("northeast", 1, 0),
-            ("southeast", 0, 0),
-            ("southeast", 1, 0),
-            ("southeast", 2, 0),
+            ("n_medium", 0, 0),
+            ("n_medium", 1, 0),
+            ("ne_large", 0, 0),
+            ("ne_large", 1, 0),
+            ("ne_large", 2, 0),
         }
 
         snapshot = supervisor.room_progress_snapshot(overlay)
 
-        self.assertEqual(
-            {
-                "northwest": 90.0,
-                "northeast": 80.0,
-                "southeast": 70.0,
-                "southwest": 100.0,
-            },
-            snapshot,
-        )
-        self.assertEqual(
-            "northwest=90.0% northeast=80.0% southeast=70.0% southwest=100.0%",
-            supervisor.format_room_progress(snapshot),
-        )
+        expected = {room: 100.0 for room in supervisor.ROOM_TASKS}
+        expected["n_medium"] = 80.0
+        expected["ne_large"] = 70.0
+        self.assertEqual(expected, snapshot)
+
+        formatted = supervisor.format_room_progress(snapshot)
+        self.assertIn("n_medium=80.0%", formatted)
+        self.assertIn("ne_large=70.0%", formatted)
+        self.assertIn("nw_small=100.0%", formatted)
 
     def test_reassignment_selects_least_clean_unfinished_room(self):
         supervisor = load_supervisor_module()
         overlay = supervisor.CleaningOverlay.__new__(supervisor.CleaningOverlay)
-        overlay.room_tile_counts = {
-            "northwest": 20,
-            "northeast": 20,
-            "southeast": 20,
-            "southwest": 20,
-        }
+        overlay.room_tile_counts = {room: 20 for room in supervisor.ROOM_TASKS}
         overlay.dirty_tiles = {
-            ("northeast", col_index, 0)
+            ("n_medium", col_index, 0)
             for col_index in range(12)
         } | {
-            ("southeast", col_index, 0)
+            ("ne_large", col_index, 0)
             for col_index in range(5)
         } | {
-            ("southwest", col_index, 0)
+            ("se_small", col_index, 0)
             for col_index in range(8)
         }
         room_assignments = {
-            "epuck_1": {"room": "northwest"},
-            "epuck_2": {"room": "northeast"},
-            "epuck_3": {"room": "southeast"},
-            "epuck_4": {"room": "southwest"},
+            "epuck_1": {"room": "nw_small"},
+            "epuck_2": {"room": "n_medium"},
+            "epuck_3": {"room": "ne_large"},
+            "epuck_4": {"room": "se_small"},
         }
 
         next_room = supervisor.select_reassignment_room(
             "epuck_1",
             room_assignments,
-            {"northwest"},
+            {"nw_small"},
             overlay,
         )
 
-        self.assertEqual("northeast", next_room)
+        self.assertEqual("n_medium", next_room)
 
     def test_reassignment_skips_room_that_already_has_helper(self):
         supervisor = load_supervisor_module()
         overlay = supervisor.CleaningOverlay.__new__(supervisor.CleaningOverlay)
-        overlay.room_tile_counts = {
-            "northwest": 20,
-            "northeast": 20,
-            "southeast": 20,
-            "southwest": 20,
-        }
+        overlay.room_tile_counts = {room: 20 for room in supervisor.ROOM_TASKS}
         overlay.dirty_tiles = {
-            ("northeast", col_index, 0)
+            ("n_medium", col_index, 0)
             for col_index in range(12)
         } | {
-            ("southeast", col_index, 0)
+            ("ne_large", col_index, 0)
             for col_index in range(6)
         }
         room_assignments = {
-            "epuck_1": {"room": "northwest"},
-            "epuck_2": {"room": "northeast"},
-            "epuck_3": {"room": "northeast", "helper": True},
-            "epuck_4": {"room": "southwest"},
+            "epuck_1": {"room": "nw_small"},
+            "epuck_2": {"room": "n_medium"},
+            "epuck_3": {"room": "n_medium", "helper": True},
+            "epuck_4": {"room": "se_small"},
         }
 
         next_room = supervisor.select_reassignment_room(
             "epuck_1",
             room_assignments,
-            {"northwest"},
+            {"nw_small"},
             overlay,
         )
 
-        self.assertEqual("southeast", next_room)
+        self.assertEqual("ne_large", next_room)
 
     def test_reassignment_returns_none_when_all_rooms_are_complete(self):
         supervisor = load_supervisor_module()
         overlay = supervisor.CleaningOverlay.__new__(supervisor.CleaningOverlay)
-        overlay.room_tile_counts = {
-            "northwest": 20,
-            "northeast": 20,
-            "southeast": 20,
-            "southwest": 20,
-        }
+        overlay.room_tile_counts = {room: 20 for room in supervisor.ROOM_TASKS}
         overlay.dirty_tiles = set()
         room_assignments = {
-            "epuck_1": {"room": "northwest"},
-            "epuck_2": {"room": "northeast"},
-            "epuck_3": {"room": "southeast"},
-            "epuck_4": {"room": "southwest"},
+            "epuck_1": {"room": "nw_small"},
+            "epuck_2": {"room": "n_medium"},
+            "epuck_3": {"room": "s_medium"},
+            "epuck_4": {"room": "se_small"},
         }
 
         next_room = supervisor.select_reassignment_room(
             "epuck_1",
             room_assignments,
-            {"northwest", "northeast", "southeast", "southwest"},
+            set(supervisor.ROOM_TASKS),
             overlay,
         )
 
@@ -294,14 +269,19 @@ class CoverageWaypointTests(unittest.TestCase):
 
     def test_build_assignment_cost_uses_current_robot_pose(self):
         supervisor = load_supervisor_module()
-        status = {"pose": {"x_m": 1.75, "y_m": 1.75}}
+        center_x_m, center_y_m = supervisor.ROOM_TASKS["ne_large"]["center"]
+        status = {"pose": {"x_m": center_x_m, "y_m": center_y_m}}
 
-        assignment = supervisor.build_assignment(status, "northeast", helper=True)
+        assignment = supervisor.build_assignment(status, "ne_large", helper=True)
 
-        self.assertEqual("northeast", assignment["room"])
-        self.assertEqual((1.75, 1.75), assignment["target"])
+        self.assertEqual("ne_large", assignment["room"])
+        self.assertEqual((center_x_m, center_y_m), assignment["target"])
         self.assertTrue(assignment["helper"])
-        self.assertEqual(0.312, assignment["cost"])
+        expected_cost = round(
+            supervisor.MRTA_AREA_WEIGHT * supervisor.ROOM_TASKS["ne_large"]["area_m2"],
+            3,
+        )
+        self.assertAlmostEqual(expected_cost, assignment["cost"])
 
     def test_send_assignment_commands_targets_one_robot(self):
         supervisor = load_supervisor_module()
@@ -315,9 +295,9 @@ class CoverageWaypointTests(unittest.TestCase):
 
         emitter = FakeEmitter()
         assignment = {
-            "room": "northeast",
-            "target": (1.75, 1.75),
-            "cost": 0.312,
+            "room": "n_medium",
+            "target": supervisor.ROOM_TASKS["n_medium"]["center"],
+            "cost": 0.5,
         }
 
         coverage_plan = supervisor.send_assignment_commands(
@@ -327,7 +307,7 @@ class CoverageWaypointTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            supervisor.generate_coverage_waypoints("northeast"),
+            supervisor.generate_coverage_waypoints("n_medium"),
             coverage_plan,
         )
         self.assertEqual(2, len(emitter.messages))
@@ -338,8 +318,8 @@ class CoverageWaypointTests(unittest.TestCase):
         self.assertEqual("coverage_plan", plan_command["type"])
         self.assertEqual("epuck_2", task_command["robot"])
         self.assertEqual("epuck_2", plan_command["robot"])
-        self.assertEqual("northeast", task_command["room"])
-        self.assertEqual("northeast", plan_command["room"])
+        self.assertEqual("n_medium", task_command["room"])
+        self.assertEqual("n_medium", plan_command["room"])
 
 
 if __name__ == "__main__":
