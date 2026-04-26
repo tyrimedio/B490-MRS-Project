@@ -340,6 +340,28 @@ def should_hold_after_task(assigned_target, assignment_target_reached, coverage_
     )
 
 
+def robot_phase(
+    launch_finished,
+    launch_timed_out,
+    assigned_target,
+    assignment_target_reached,
+    coverage_complete,
+    coverage_plan_kind,
+):
+    """Return a plain-language state name for logs and supervisor status."""
+    if not launch_finished and not launch_timed_out:
+        return "launching"
+    if assigned_target is None:
+        return "waiting_for_assignment"
+    if not assignment_target_reached:
+        return "driving_to_room"
+    if coverage_complete:
+        return "holding_after_task"
+    if coverage_plan_kind == "cleanup":
+        return "cleanup"
+    return "sweeping"
+
+
 def run():
     robot = Robot()
     timestep = int(robot.getBasicTimeStep())
@@ -429,10 +451,14 @@ def run():
     coverage_waypoints = []
     coverage_waypoint_index = 0
     coverage_complete = False
+    coverage_plan_kind = "sweep"
+    coverage_lane_index = 0
+    coverage_lane_count = 1
     last_wall_hit = None
     last_lidar_log_key = None
     last_lidar_log_step = -LIDAR_STATUS_HEARTBEAT_STEPS
     last_pose_correction_log_step = -POSE_CORRECTION_LOG_INTERVAL_STEPS
+    last_robot_phase = None
 
     def should_log_lidar(log_key):
         nonlocal last_lidar_log_key, last_lidar_log_step
@@ -518,6 +544,9 @@ def run():
                         coverage_waypoints = []
                         coverage_waypoint_index = 0
                         coverage_complete = True
+                        coverage_plan_kind = "idle"
+                        coverage_lane_index = 0
+                        coverage_lane_count = 1
                         print(f"[{robot_name}] Holding idle")
                 elif command_message.get("type") == "coverage_plan":
                     target_robot = command_message.get("robot")
@@ -531,10 +560,57 @@ def run():
                                 )
                         coverage_waypoint_index = 0
                         coverage_complete = len(coverage_waypoints) == 0
-                        print(
-                            f"[{robot_name}] Coverage plan loaded for "
-                            f"{coverage_room}: {len(coverage_waypoints)} waypoint(s)"
+                        coverage_plan_kind = command_message.get("plan_kind", "sweep")
+                        if coverage_plan_kind not in ("sweep", "cleanup"):
+                            coverage_plan_kind = "sweep"
+                        try:
+                            coverage_lane_index = int(
+                                command_message.get("lane_index", 0)
+                            )
+                            coverage_lane_count = int(
+                                command_message.get("lane_count", 1)
+                            )
+                        except (TypeError, ValueError):
+                            coverage_lane_index = 0
+                            coverage_lane_count = 1
+                        coverage_lane_count = max(1, coverage_lane_count)
+                        coverage_lane_index = max(
+                            0,
+                            min(coverage_lane_count - 1, coverage_lane_index),
                         )
+                        print(
+                            f"[{robot_name}] {coverage_plan_kind} plan loaded for "
+                            f"{coverage_room}: {len(coverage_waypoints)} waypoint(s), "
+                            f"lane {coverage_lane_index + 1}/{coverage_lane_count}"
+                        )
+                elif command_message.get("type") == "recovery":
+                    target_robot = command_message.get("robot")
+                    if target_robot in (robot_name, "all"):
+                        try:
+                            escape_reverse_steps = max(
+                                0,
+                                int(
+                                    command_message.get(
+                                        "reverse_steps",
+                                        ESCAPE_REVERSE_STEPS,
+                                    )
+                                ),
+                            )
+                            escape_turn_steps = max(
+                                0,
+                                int(
+                                    command_message.get(
+                                        "turn_steps",
+                                        ESCAPE_TURN_STEPS,
+                                    )
+                                ),
+                            )
+                        except (TypeError, ValueError):
+                            escape_reverse_steps = ESCAPE_REVERSE_STEPS
+                            escape_turn_steps = ESCAPE_TURN_STEPS
+                        escape_turn_left = not escape_turn_left
+                        reason = command_message.get("reason", "supervisor request")
+                        print(f"[{robot_name}] Recovery nudge requested: {reason}")
                 elif command_message.get("type") == "pose_correction":
                     target_robot = command_message.get("robot")
                     if target_robot in (robot_name, "all"):
@@ -839,6 +915,18 @@ def run():
         left_motor.setVelocity(left_speed)
         right_motor.setVelocity(right_speed)
 
+        current_phase = robot_phase(
+            launch_finished,
+            launch_timed_out,
+            assigned_target,
+            assignment_target_reached,
+            coverage_complete,
+            coverage_plan_kind,
+        )
+        if current_phase != last_robot_phase:
+            last_robot_phase = current_phase
+            print(f"[{robot_name}] State: {current_phase}")
+
         if emitter is not None and step_count % COMMUNICATION_SEND_INTERVAL_STEPS == 0:
             map_update = occupancy_grid.drain_pending_updates()
             message = {
@@ -856,6 +944,7 @@ def run():
                     "complete": launch_waypoint_index >= len(launch_waypoints),
                     "timed_out": launch_timed_out,
                 },
+                "phase": current_phase,
                 "mapping_enabled": mapping_enabled,
                 "assigned_room": assigned_room,
                 "assignment_target_reached": assignment_target_reached,
@@ -868,6 +957,18 @@ def run():
                     "waypoint_index": coverage_waypoint_index,
                     "waypoint_count": len(coverage_waypoints),
                     "complete": coverage_complete,
+                    "plan_kind": coverage_plan_kind,
+                    "lane_index": coverage_lane_index,
+                    "lane_count": coverage_lane_count,
+                },
+                "motion": {
+                    "left_speed": round(left_speed_cmd, 3),
+                    "right_speed": round(right_speed_cmd, 3),
+                    "front_blocked": front_blocked,
+                    "left_blocked": left_side,
+                    "right_blocked": right_side,
+                    "rear_blocked": rear_blocked,
+                    "corner_pressure": corner_pressure,
                 },
                 "free_cell_count": occupancy_grid.free_cell_count,
                 "wall_cell_count": occupancy_grid.wall_cell_count,
