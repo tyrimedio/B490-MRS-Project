@@ -145,6 +145,73 @@ class CoverageWaypointTests(unittest.TestCase):
 
         self.assertLessEqual(distance_when_reached_m, supervisor.CLEAN_RADIUS_M)
 
+    def test_odometry_uses_midpoint_heading_for_turning_motion(self):
+        controller = load_controller_module()
+
+        left_speed = 1.0
+        right_speed = 2.0
+        dt_s = 1.0
+        x_m, y_m, theta_rad, distance_delta_m, turn_delta_rad = (
+            controller.integrate_odometry_pose(
+                0.0,
+                0.0,
+                0.0,
+                left_speed,
+                right_speed,
+                dt_s,
+            )
+        )
+
+        left_linear_mps = left_speed * controller.WHEEL_RADIUS_M
+        right_linear_mps = right_speed * controller.WHEEL_RADIUS_M
+        forward_mps = 0.5 * (left_linear_mps + right_linear_mps)
+        heading_delta_rad = (
+            (right_linear_mps - left_linear_mps)
+            / controller.AXLE_LENGTH_M
+            * dt_s
+        )
+
+        self.assertAlmostEqual(
+            forward_mps * controller.math.cos(0.5 * heading_delta_rad),
+            x_m,
+        )
+        self.assertAlmostEqual(
+            forward_mps * controller.math.sin(0.5 * heading_delta_rad),
+            y_m,
+        )
+        self.assertAlmostEqual(heading_delta_rad, theta_rad)
+        self.assertAlmostEqual(forward_mps, distance_delta_m)
+        self.assertAlmostEqual(abs(heading_delta_rad), turn_delta_rad)
+
+    def test_lidar_geometry_uses_forward_offset_and_beam_fan(self):
+        controller = load_controller_module()
+
+        origin_x_m, origin_y_m = controller.lidar_sensor_origin(1.0, 2.0, 0.0)
+        rays = controller.lidar_free_ray_endpoints(1.0, 2.0, 0.0, 0.5)
+        hit_x_m, hit_y_m = controller.lidar_wall_hit_point(1.0, 2.0, 0.0, 0.5)
+
+        self.assertAlmostEqual(1.0 + controller.LIDAR_FORWARD_OFFSET_M, origin_x_m)
+        self.assertAlmostEqual(2.0, origin_y_m)
+        self.assertEqual(3, len(rays))
+        self.assertTrue(all(ray[0] == origin_x_m for ray in rays))
+        self.assertTrue(all(ray[1] == origin_y_m for ray in rays))
+        self.assertAlmostEqual(origin_x_m + 0.5, hit_x_m)
+        self.assertAlmostEqual(origin_y_m, hit_y_m)
+        self.assertLess(rays[0][3], origin_y_m)
+        self.assertGreater(rays[2][3], origin_y_m)
+
+    def test_pose_confidence_decays_with_odometry_distance_and_turning(self):
+        controller = load_controller_module()
+
+        confident = controller.pose_confidence_from_odometry(0.0, 0.0)
+        stale = controller.pose_confidence_from_odometry(
+            controller.POSE_CONFIDENCE_DISTANCE_DECAY_M,
+            controller.POSE_CONFIDENCE_TURN_DECAY_RAD,
+        )
+
+        self.assertEqual(1.0, confident)
+        self.assertEqual(controller.MIN_POSE_CONFIDENCE, stale)
+
     def test_robot_holds_after_launch_until_assignment_arrives(self):
         controller = load_controller_module()
 
@@ -1084,6 +1151,17 @@ class CoverageWaypointTests(unittest.TestCase):
         self.assertEqual([1.85, 0.93], route[-2])
         self.assertEqual([1.85, 1.875], route[-1])
 
+    def test_assignment_route_from_hub_skips_shared_center_waypoint(self):
+        supervisor = load_supervisor_module()
+        pose = {"x_m": -0.3, "y_m": 0.1}
+
+        route = supervisor.generate_assignment_route(pose, "n_medium")
+
+        self.assertNotIn(supervisor.HUB_ROUTE_WAYPOINT, route)
+        self.assertEqual([-0.4, 0.57], route[0])
+        self.assertEqual([-0.4, 0.93], route[1])
+        self.assertEqual([-0.4, 1.875], route[2])
+
     def test_send_assignment_commands_targets_one_robot(self):
         supervisor = load_supervisor_module()
 
@@ -1411,6 +1489,95 @@ class CoverageWaypointTests(unittest.TestCase):
         self.assertEqual(robot_grid.scores[5][5], global_grid.scores[5][5])
         self.assertEqual(robot_grid.data[5][5], global_grid.data[5][5])
         self.assertEqual(supervisor.GRID_FREE, global_grid.data[5][5])
+
+    def test_scan_match_shifts_update_toward_existing_wall_cells(self):
+        supervisor = load_supervisor_module()
+        grid = supervisor.GlobalOccupancyGrid(world_size_m=1.0, cell_size_m=0.1)
+
+        for _ in range(2):
+            grid.add_cell_evidence(5, 5, supervisor.WALL_EVIDENCE)
+            grid.add_cell_evidence(5, 6, supervisor.WALL_EVIDENCE)
+        map_update = {
+            "observations": [
+                ["wall", 6, 5, 2],
+                ["wall", 6, 6, 2],
+            ]
+        }
+
+        scan_match = grid.scan_match_update(map_update)
+
+        self.assertTrue(scan_match["accepted"])
+        self.assertEqual([-1, 0], scan_match["offset_cells"])
+        self.assertEqual(
+            [["wall", 5, 5, 2], ["wall", 5, 6, 2]],
+            scan_match["map_update"]["observations"],
+        )
+
+    def test_scan_match_rejects_offsets_without_enough_existing_map_support(self):
+        supervisor = load_supervisor_module()
+        grid = supervisor.GlobalOccupancyGrid(world_size_m=1.0, cell_size_m=0.1)
+
+        scan_match = grid.scan_match_update(
+            {"observations": [["wall", 6, 5, 2]]}
+        )
+
+        self.assertFalse(scan_match["accepted"])
+        self.assertEqual([0, 0], scan_match["offset_cells"])
+
+    def test_scan_match_does_not_accept_free_space_only_offsets(self):
+        supervisor = load_supervisor_module()
+        grid = supervisor.GlobalOccupancyGrid(world_size_m=1.0, cell_size_m=0.1)
+
+        for _ in range(2):
+            grid.add_cell_evidence(5, 5, supervisor.FREE_EVIDENCE)
+            grid.add_cell_evidence(5, 6, supervisor.FREE_EVIDENCE)
+
+        scan_match = grid.scan_match_update(
+            {
+                "observations": [
+                    ["free", 6, 5, 2],
+                    ["free", 6, 6, 2],
+                ]
+            }
+        )
+
+        self.assertFalse(scan_match["accepted"])
+        self.assertEqual([0, 0], scan_match["offset_cells"])
+
+    def test_ground_truth_correction_is_only_fallback_for_stale_or_drifted_pose(self):
+        supervisor = load_supervisor_module()
+        actual_pose = {"x_m": 0.0, "y_m": 0.0, "theta_rad": 0.0}
+        fresh_status = {
+            "pose": {"x_m": 0.1, "y_m": 0.0, "theta_rad": 0.1},
+            "localization": {"confidence": 0.9},
+        }
+        stale_status = {
+            "pose": {"x_m": 0.1, "y_m": 0.0, "theta_rad": 0.1},
+            "localization": {"confidence": 0.1},
+        }
+        drifted_status = {
+            "pose": {"x_m": 1.0, "y_m": 0.0, "theta_rad": 0.1},
+            "localization": {"confidence": 0.9},
+        }
+
+        self.assertFalse(
+            supervisor.should_send_ground_truth_pose_correction(
+                fresh_status,
+                actual_pose,
+            )
+        )
+        self.assertTrue(
+            supervisor.should_send_ground_truth_pose_correction(
+                stale_status,
+                actual_pose,
+            )
+        )
+        self.assertTrue(
+            supervisor.should_send_ground_truth_pose_correction(
+                drifted_status,
+                actual_pose,
+            )
+        )
 
     def test_supervisor_grid_keeps_legacy_map_update_support(self):
         supervisor = load_supervisor_module()

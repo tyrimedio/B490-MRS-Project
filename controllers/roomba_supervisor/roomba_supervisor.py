@@ -11,7 +11,15 @@ import math
 from controller import Supervisor
 
 COMMUNICATION_SUMMARY_INTERVAL_STEPS = 120
-POSE_CORRECTION_INTERVAL_STEPS = 10
+MAP_UPDATE_LOG_INTERVAL_STEPS = 120
+GROUND_TRUTH_POSE_CORRECTION_INTERVAL_STEPS = 30
+SCAN_MATCH_LOG_INTERVAL_STEPS = 120
+SCAN_MATCH_MAX_OFFSET_CELLS = 2
+SCAN_MATCH_MIN_SCORE_GAIN = 3
+SCAN_MATCH_MIN_INFORMATIVE_CELLS = 2
+GROUND_TRUTH_DRIFT_CORRECTION_M = 0.45
+GROUND_TRUTH_HEADING_CORRECTION_RAD = 0.75
+LOCALIZATION_MIN_CONFIDENCE = 0.35
 EXPECTED_ROBOTS = ("epuck_1", "epuck_2", "epuck_3", "epuck_4")
 ROBOT_DEF_NAMES = {
     "epuck_1": "EPUCK_1",
@@ -172,7 +180,11 @@ def generate_assignment_route(pose, target_room):
         append_route_waypoint(route, current_inside)
         append_route_waypoint(route, current_hub)
 
-    append_route_waypoint(route, HUB_ROUTE_WAYPOINT)
+    # Robots already in the central hub should fan out straight to their
+    # destination doorways. Sending every hub robot through the exact center
+    # makes the first assignment look like a traffic jam.
+    if current_room is not None:
+        append_route_waypoint(route, HUB_ROUTE_WAYPOINT)
 
     target_inside, target_hub = room_doorway_waypoints(target_room)
     append_route_waypoint(route, target_hub)
@@ -234,6 +246,252 @@ class GlobalOccupancyGrid:
             and isinstance(count, int)
             and count > 0
         )
+
+    def iter_update_observations(self, map_update):
+        """Yield map observations as kind, x, y, count tuples."""
+        if not isinstance(map_update, dict):
+            return
+
+        if "observations" in map_update:
+            for observation in map_update.get("observations", []):
+                if self.is_valid_ordered_observation(observation):
+                    yield tuple(observation)
+            return
+
+        for observation in map_update.get("free_observations", []):
+            if self.is_valid_observation(observation):
+                grid_x, grid_y, count = observation
+                yield "free", grid_x, grid_y, count
+
+        for observation in map_update.get("wall_observations", []):
+            if self.is_valid_observation(observation):
+                grid_x, grid_y, count = observation
+                yield "wall", grid_x, grid_y, count
+
+        if (
+            "free_observations" in map_update
+            or "wall_observations" in map_update
+            or "observations" in map_update
+        ):
+            return
+
+        for cell in map_update.get("free_cells", []):
+            if self.is_valid_cell(cell):
+                grid_x, grid_y = cell
+                yield "free", grid_x, grid_y, 1
+
+        for cell in map_update.get("wall_cells", []):
+            if self.is_valid_cell(cell):
+                grid_x, grid_y = cell
+                yield "wall", grid_x, grid_y, 1
+
+    def scan_match_score(self, map_update, offset_x_cells, offset_y_cells):
+        """
+        Score how well one robot update lines up with the existing global map.
+
+        This is a small translation-only scan match. It tries sliding the new
+        mini-map by a few grid cells and scores only wall features, because
+        open floor readings are common enough that they can make a bad offset
+        look good. Think of it like nudging tracing paper until the wall marks
+        line up with the shared map underneath.
+        """
+        wall_observations = list(self.iter_wall_update_observations(map_update))
+        return self.scan_match_observation_score(
+            wall_observations,
+            offset_x_cells,
+            offset_y_cells,
+        )
+
+    def iter_wall_update_observations(self, map_update):
+        """Yield only wall observations, since free cells are not scored."""
+        for kind, grid_x, grid_y, count in self.iter_update_observations(map_update):
+            if kind == "wall":
+                yield grid_x, grid_y, count
+
+    def scan_match_observation_score(
+        self,
+        wall_observations,
+        offset_x_cells,
+        offset_y_cells,
+    ):
+        """Score pre-filtered wall observations for one candidate offset."""
+        score = 0
+        informative_cells = 0
+        for grid_x, grid_y, count in wall_observations:
+            shifted_x = grid_x + offset_x_cells
+            shifted_y = grid_y + offset_y_cells
+            weight = min(count, 3)
+            if not self.is_valid_cell([shifted_x, shifted_y]):
+                score -= weight
+                continue
+
+            existing_state = self.data[shifted_y][shifted_x]
+            if existing_state == GRID_UNKNOWN:
+                continue
+
+            informative_cells += 1
+            if existing_state == GRID_WALL:
+                score += 3 * weight
+            elif existing_state == GRID_FREE:
+                score -= 4 * weight
+
+        score -= abs(offset_x_cells) + abs(offset_y_cells)
+        return score, informative_cells
+
+    def shifted_map_update(self, map_update, offset_x_cells, offset_y_cells):
+        """Return a copy of a map update with every cell shifted by an offset."""
+        if not isinstance(map_update, dict):
+            return {}
+
+        shifted_update = {}
+        if "observations" in map_update:
+            observations = []
+            for observation in map_update.get("observations", []):
+                if not self.is_valid_ordered_observation(observation):
+                    continue
+                kind, grid_x, grid_y, count = observation
+                shifted_x = grid_x + offset_x_cells
+                shifted_y = grid_y + offset_y_cells
+                if self.is_valid_cell([shifted_x, shifted_y]):
+                    observations.append([kind, shifted_x, shifted_y, count])
+            shifted_update["observations"] = observations
+
+        if "free_observations" in map_update:
+            shifted_update["free_observations"] = self.shifted_observations(
+                map_update.get("free_observations", []),
+                offset_x_cells,
+                offset_y_cells,
+            )
+        if "wall_observations" in map_update:
+            shifted_update["wall_observations"] = self.shifted_observations(
+                map_update.get("wall_observations", []),
+                offset_x_cells,
+                offset_y_cells,
+            )
+        if "free_cells" in map_update:
+            shifted_update["free_cells"] = self.shifted_cells(
+                map_update.get("free_cells", []),
+                offset_x_cells,
+                offset_y_cells,
+            )
+        if "wall_cells" in map_update:
+            shifted_update["wall_cells"] = self.shifted_cells(
+                map_update.get("wall_cells", []),
+                offset_x_cells,
+                offset_y_cells,
+            )
+        return shifted_update
+
+    def shifted_observations(self, observations, offset_x_cells, offset_y_cells):
+        """Shift [x, y, count] observations while dropping cells outside the map."""
+        shifted = []
+        for observation in observations:
+            if not self.is_valid_observation(observation):
+                continue
+            grid_x, grid_y, count = observation
+            shifted_x = grid_x + offset_x_cells
+            shifted_y = grid_y + offset_y_cells
+            if self.is_valid_cell([shifted_x, shifted_y]):
+                shifted.append([shifted_x, shifted_y, count])
+        return shifted
+
+    def shifted_cells(self, cells, offset_x_cells, offset_y_cells):
+        """Shift [x, y] cells while dropping cells outside the map."""
+        shifted = []
+        for cell in cells:
+            if not self.is_valid_cell(cell):
+                continue
+            grid_x, grid_y = cell
+            shifted_x = grid_x + offset_x_cells
+            shifted_y = grid_y + offset_y_cells
+            if self.is_valid_cell([shifted_x, shifted_y]):
+                shifted.append([shifted_x, shifted_y])
+        return shifted
+
+    def scan_match_update(self, map_update):
+        """Return a scan-matched map update and the accepted cell offset."""
+        empty_match = {
+            "accepted": False,
+            "map_update": map_update if isinstance(map_update, dict) else {},
+            "offset_cells": [0, 0],
+            "offset_m": [0.0, 0.0],
+            "score": 0,
+            "score_gain": 0,
+            "informative_cells": 0,
+        }
+        if not isinstance(map_update, dict):
+            return empty_match
+
+        wall_observations = list(self.iter_wall_update_observations(map_update))
+        if not wall_observations:
+            return empty_match
+
+        baseline_score, baseline_informative = self.scan_match_observation_score(
+            wall_observations,
+            0,
+            0,
+        )
+        best = {
+            "offset_cells": [0, 0],
+            "score": baseline_score,
+            "informative_cells": baseline_informative,
+        }
+        for offset_x in range(-SCAN_MATCH_MAX_OFFSET_CELLS, SCAN_MATCH_MAX_OFFSET_CELLS + 1):
+            for offset_y in range(
+                -SCAN_MATCH_MAX_OFFSET_CELLS,
+                SCAN_MATCH_MAX_OFFSET_CELLS + 1,
+            ):
+                if offset_x == 0 and offset_y == 0:
+                    continue
+                score, informative_cells = self.scan_match_observation_score(
+                    wall_observations,
+                    offset_x,
+                    offset_y,
+                )
+                if (
+                    score > best["score"]
+                    or (
+                        score == best["score"]
+                        and abs(offset_x) + abs(offset_y)
+                        < abs(best["offset_cells"][0]) + abs(best["offset_cells"][1])
+                    )
+                ):
+                    best = {
+                        "offset_cells": [offset_x, offset_y],
+                        "score": score,
+                        "informative_cells": informative_cells,
+                    }
+
+        score_gain = best["score"] - baseline_score
+        accepted = (
+            best["offset_cells"] != [0, 0]
+            and score_gain >= SCAN_MATCH_MIN_SCORE_GAIN
+            and best["informative_cells"] >= SCAN_MATCH_MIN_INFORMATIVE_CELLS
+        )
+        if not accepted:
+            return {
+                "accepted": False,
+                "map_update": map_update,
+                "offset_cells": [0, 0],
+                "offset_m": [0.0, 0.0],
+                "score": baseline_score,
+                "score_gain": 0,
+                "informative_cells": baseline_informative,
+            }
+
+        offset_x, offset_y = best["offset_cells"]
+        return {
+            "accepted": True,
+            "map_update": self.shifted_map_update(map_update, offset_x, offset_y),
+            "offset_cells": best["offset_cells"],
+            "offset_m": [
+                round(offset_x * self.cell_size_m, 4),
+                round(offset_y * self.cell_size_m, 4),
+            ],
+            "score": best["score"],
+            "score_gain": score_gain,
+            "informative_cells": best["informative_cells"],
+        }
 
     def mark_free(self, grid_x, grid_y):
         """Apply enough free evidence to support older map updates."""
@@ -523,6 +781,79 @@ def get_actual_robot_pose(supervisor, robot_name):
         pose["theta_rad"] = normalize_angle(theta_rad)
 
     return pose
+
+
+def pose_error(status_pose, reference_pose):
+    """Return position and heading error between two poses."""
+    if status_pose is None or reference_pose is None:
+        return None
+
+    try:
+        position_error_m = math.hypot(
+            reference_pose["x_m"] - status_pose["x_m"],
+            reference_pose["y_m"] - status_pose["y_m"],
+        )
+        heading_error_rad = abs(
+            normalize_angle(
+                reference_pose.get("theta_rad", 0.0)
+                - status_pose.get("theta_rad", 0.0)
+            )
+        )
+    except (KeyError, TypeError):
+        return None
+
+    return position_error_m, heading_error_rad
+
+
+def localization_confidence(status):
+    """Read the robot-reported pose confidence, defaulting to zero."""
+    localization = status.get("localization", {})
+    try:
+        return float(localization.get("confidence", 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def should_send_ground_truth_pose_correction(status, actual_pose):
+    """
+    Return True when Webots truth should correct the robot pose.
+
+    Ground truth is now a fallback guardrail. The supervisor lets odometry and
+    scan matching carry normal localization, then uses Webots truth only when
+    the robot says its estimate is stale or measured drift is too large.
+    """
+    if status is None or actual_pose is None:
+        return False
+
+    error = pose_error(status.get("pose"), actual_pose)
+    if error is None:
+        return True
+
+    position_error_m, heading_error_rad = error
+    return (
+        position_error_m >= GROUND_TRUTH_DRIFT_CORRECTION_M
+        or heading_error_rad >= GROUND_TRUTH_HEADING_CORRECTION_RAD
+        or localization_confidence(status) < LOCALIZATION_MIN_CONFIDENCE
+    )
+
+
+def send_pose_correction(emitter, robot_name, pose, source, blend=1.0):
+    """Send a pose correction command with its source and blend strength."""
+    emitter.send(
+        json.dumps(
+            {
+                "type": "pose_correction",
+                "robot": robot_name,
+                "source": source,
+                "blend": round(blend, 3),
+                "pose": {
+                    "x_m": round(pose["x_m"], 4),
+                    "y_m": round(pose["y_m"], 4),
+                    "theta_rad": round(pose.get("theta_rad", 0.0), 4),
+                },
+            }
+        )
+    )
 
 
 def interpolate_cleaning_path(start_pose, end_pose):
@@ -1463,6 +1794,8 @@ def run():
     cleanup_plan_steps = {}
     robot_motion_monitors = {}
     room_progress_monitors = {}
+    last_scan_match_log_steps = {}
+    last_map_update_log_steps = {}
     completed_rooms = set()
     completed_robot_rooms = {}
     assignments_sent = False
@@ -1492,20 +1825,46 @@ def run():
 
             robot_name = message.get("robot", "unknown_robot")
             first_message = robot_name not in latest_robot_status
+            raw_map_update = message.get("map_update", {})
+            scan_match = global_grid.scan_match_update(raw_map_update)
+            map_update = scan_match["map_update"]
+            if scan_match["accepted"]:
+                message["map_update"] = map_update
+                message["localization"] = dict(message.get("localization", {}))
+                message["localization"]["scan_match"] = {
+                    "offset_cells": scan_match["offset_cells"],
+                    "offset_m": scan_match["offset_m"],
+                    "score_gain": scan_match["score_gain"],
+                    "informative_cells": scan_match["informative_cells"],
+                }
+                last_scan_step = last_scan_match_log_steps.get(robot_name, -999999)
+                if step_count - last_scan_step >= SCAN_MATCH_LOG_INTERVAL_STEPS:
+                    last_scan_match_log_steps[robot_name] = step_count
+                    print(
+                        f"[supervisor] Scan matched map update from {robot_name}: "
+                        f"offset=({scan_match['offset_m'][0]:.2f}, "
+                        f"{scan_match['offset_m'][1]:.2f})m "
+                        f"score_gain={scan_match['score_gain']}"
+                    )
+
             latest_robot_status[robot_name] = message
-            new_free_cells, new_wall_cells = global_grid.merge_update(
-                message.get("map_update", {})
-            )
+            new_free_cells, new_wall_cells = global_grid.merge_update(map_update)
 
             if first_message:
                 print(f"[supervisor] Connected to {robot_name}")
             if new_free_cells or new_wall_cells:
-                print(
-                    f"[supervisor] Map update from {robot_name}: "
-                    f"free+={new_free_cells} wall+={new_wall_cells} "
-                    f"global_free={global_grid.free_cell_count} "
-                    f"global_walls={global_grid.wall_cell_count}"
+                last_map_log_step = last_map_update_log_steps.get(
+                    robot_name,
+                    -MAP_UPDATE_LOG_INTERVAL_STEPS,
                 )
+                if step_count - last_map_log_step >= MAP_UPDATE_LOG_INTERVAL_STEPS:
+                    last_map_update_log_steps[robot_name] = step_count
+                    print(
+                        f"[supervisor] Map update from {robot_name}: "
+                        f"free+={new_free_cells} wall+={new_wall_cells} "
+                        f"global_free={global_grid.free_cell_count} "
+                        f"global_walls={global_grid.wall_cell_count}"
+                    )
 
             assignment = room_assignments.get(robot_name)
             pose = get_actual_robot_pose(supervisor, robot_name)
@@ -1531,24 +1890,19 @@ def run():
             else:
                 last_cleaning_poses.pop(robot_name, None)
 
-        if step_count % POSE_CORRECTION_INTERVAL_STEPS == 0:
+        if step_count % GROUND_TRUTH_POSE_CORRECTION_INTERVAL_STEPS == 0:
             for robot_name in EXPECTED_ROBOTS:
+                status = latest_robot_status.get(robot_name)
                 pose = get_actual_robot_pose(supervisor, robot_name)
-                if pose is None:
+                if not should_send_ground_truth_pose_correction(status, pose):
                     continue
 
-                emitter.send(
-                    json.dumps(
-                        {
-                            "type": "pose_correction",
-                            "robot": robot_name,
-                            "pose": {
-                                "x_m": round(pose["x_m"], 4),
-                                "y_m": round(pose["y_m"], 4),
-                                "theta_rad": round(pose.get("theta_rad", 0.0), 4),
-                            },
-                        }
-                    )
+                send_pose_correction(
+                    emitter,
+                    robot_name,
+                    pose,
+                    source="ground_truth",
+                    blend=1.0,
                 )
 
         ready_for_assignment = (

@@ -27,16 +27,23 @@ SENSOR_NAMES = [
 OBSTACLE_THRESHOLD = 80.0  # proximity value that counts as "something is close"
 MAX_SPEED = 6.28           # max motor speed in rad/s for e-puck
 CRUISE_SPEED = 0.9 * MAX_SPEED
-LIDAR_STATUS_HEARTBEAT_STEPS = 240
+LIDAR_EVENT_LOG_INTERVAL_STEPS = 240
+LIDAR_DETAIL_LOG_INTERVAL_STEPS = 900
 LIDAR_VALUE_AT_1_METER = 1000.0
 LIDAR_MAX_RANGE_M = 1.0
 LIDAR_NO_HIT_MARGIN = 1.0
 LIDAR_MIN_VALID_HIT_M = 0.03
 LIDAR_MAX_VALID_HIT_M = 0.95
+LIDAR_FORWARD_OFFSET_M = 0.035
+LIDAR_BEAM_HALF_ANGLE_RAD = math.radians(7.5)
+LIDAR_WALL_CLEARANCE_M = 0.04
 COMMUNICATION_SEND_INTERVAL_STEPS = 30
 POSE_CORRECTION_DRIFT_LOG_M = 0.15
 POSE_CORRECTION_HEADING_LOG_RAD = 0.35
 POSE_CORRECTION_LOG_INTERVAL_STEPS = 120
+POSE_CONFIDENCE_DISTANCE_DECAY_M = 4.0
+POSE_CONFIDENCE_TURN_DECAY_RAD = 8.0
+MIN_POSE_CONFIDENCE = 0.2
 
 # Initial Webots poses for the four robots in the shared world frame.
 # These match the robot translations and rotations in worlds/roomba_cluster.wbt.
@@ -291,6 +298,94 @@ def clamp(value, low, high):
     return max(low, min(high, value))
 
 
+def integrate_odometry_pose(
+    x_m,
+    y_m,
+    theta_rad,
+    left_speed_rad_s,
+    right_speed_rad_s,
+    dt_s,
+):
+    """
+    Estimate the next pose from wheel speeds.
+
+    This is dead reckoning: like counting your steps and turns while walking
+    with your eyes closed. It drifts over time, but midpoint integration keeps
+    turning motion closer to a real arc than updating x/y after the full turn.
+    """
+    left_linear_mps = left_speed_rad_s * WHEEL_RADIUS_M
+    right_linear_mps = right_speed_rad_s * WHEEL_RADIUS_M
+    forward_mps = 0.5 * (left_linear_mps + right_linear_mps)
+    yaw_rate_rps = (right_linear_mps - left_linear_mps) / AXLE_LENGTH_M
+
+    heading_delta_rad = yaw_rate_rps * dt_s
+    midpoint_theta_rad = normalize_angle(theta_rad + 0.5 * heading_delta_rad)
+    next_theta_rad = normalize_angle(theta_rad + heading_delta_rad)
+    next_x_m = x_m + forward_mps * math.cos(midpoint_theta_rad) * dt_s
+    next_y_m = y_m + forward_mps * math.sin(midpoint_theta_rad) * dt_s
+    distance_delta_m = abs(forward_mps) * dt_s
+    turn_delta_rad = abs(heading_delta_rad)
+    return next_x_m, next_y_m, next_theta_rad, distance_delta_m, turn_delta_rad
+
+
+def pose_confidence_from_odometry(distance_since_correction_m, turn_since_correction_rad):
+    """
+    Return a rough 0..1 confidence score for wheel-only pose.
+
+    A higher number means the robot has not driven or turned much since its last
+    outside pose correction. It is not probability; it is just a practical signal
+    for the supervisor about when dead reckoning is getting stale.
+    """
+    distance_part = distance_since_correction_m / POSE_CONFIDENCE_DISTANCE_DECAY_M
+    turn_part = turn_since_correction_rad / POSE_CONFIDENCE_TURN_DECAY_RAD
+    return round(clamp(1.0 - distance_part - turn_part, MIN_POSE_CONFIDENCE, 1.0), 3)
+
+
+def lidar_sensor_origin(robot_x_m, robot_y_m, robot_theta_rad):
+    """Return the lidar origin after its small forward offset from robot center."""
+    return (
+        robot_x_m + LIDAR_FORWARD_OFFSET_M * math.cos(robot_theta_rad),
+        robot_y_m + LIDAR_FORWARD_OFFSET_M * math.sin(robot_theta_rad),
+    )
+
+
+def lidar_free_ray_endpoints(robot_x_m, robot_y_m, robot_theta_rad, distance_m):
+    """
+    Return the end points of a tiny lidar beam fan.
+
+    The Webots DistanceSensor gives one range value, but the real beam has some
+    width. Marking a narrow fan as free space makes the map less needle-like
+    while still marking only the center point as a wall hit.
+    """
+    origin_x_m, origin_y_m = lidar_sensor_origin(robot_x_m, robot_y_m, robot_theta_rad)
+    clamped_distance_m = max(0.0, distance_m)
+    endpoints = []
+    for angle_offset_rad in (
+        -LIDAR_BEAM_HALF_ANGLE_RAD,
+        0.0,
+        LIDAR_BEAM_HALF_ANGLE_RAD,
+    ):
+        beam_angle_rad = robot_theta_rad + angle_offset_rad
+        endpoints.append(
+            (
+                origin_x_m,
+                origin_y_m,
+                origin_x_m + clamped_distance_m * math.cos(beam_angle_rad),
+                origin_y_m + clamped_distance_m * math.sin(beam_angle_rad),
+            )
+        )
+    return endpoints
+
+
+def lidar_wall_hit_point(robot_x_m, robot_y_m, robot_theta_rad, distance_m):
+    """Return the center-beam wall hit point in world coordinates."""
+    origin_x_m, origin_y_m = lidar_sensor_origin(robot_x_m, robot_y_m, robot_theta_rad)
+    return (
+        origin_x_m + distance_m * math.cos(robot_theta_rad),
+        origin_y_m + distance_m * math.sin(robot_theta_rad),
+    )
+
+
 def get_optional_device(robot, device_name):
     """Return a Webots device if it exists on this robot."""
     try:
@@ -435,6 +530,10 @@ def run():
     robot_x_m = start_x_m
     robot_y_m = start_y_m
     robot_theta_rad = start_theta_rad
+    odometry_distance_since_correction_m = 0.0
+    odometry_turn_since_correction_rad = 0.0
+    pose_correction_count = 0
+    last_pose_correction_source = "initial_pose"
     corner_pressure_steps = 0
     escape_reverse_steps = 0
     escape_turn_steps = 0
@@ -455,19 +554,19 @@ def run():
     coverage_lane_index = 0
     coverage_lane_count = 1
     last_wall_hit = None
-    last_lidar_log_key = None
-    last_lidar_log_step = -LIDAR_STATUS_HEARTBEAT_STEPS
+    last_lidar_log_steps = {}
     last_pose_correction_log_step = -POSE_CORRECTION_LOG_INTERVAL_STEPS
     last_robot_phase = None
 
-    def should_log_lidar(log_key):
-        nonlocal last_lidar_log_key, last_lidar_log_step
-
-        state_changed = log_key != last_lidar_log_key
-        heartbeat_due = (step_count - last_lidar_log_step) >= LIDAR_STATUS_HEARTBEAT_STEPS
-        if state_changed or heartbeat_due:
-            last_lidar_log_key = log_key
-            last_lidar_log_step = step_count
+    def should_log_lidar(log_key, important=False):
+        interval_steps = (
+            LIDAR_EVENT_LOG_INTERVAL_STEPS
+            if important
+            else LIDAR_DETAIL_LOG_INTERVAL_STEPS
+        )
+        last_log_step = last_lidar_log_steps.get(log_key, -interval_steps)
+        if step_count - last_log_step >= interval_steps:
+            last_lidar_log_steps[log_key] = step_count
             return True
         return False
 
@@ -482,15 +581,23 @@ def run():
                 mapping_enabled = True
                 print(f"[{robot_name}] Mapping enabled")
 
-        # Update a simple odometry estimate from the previous wheel commands.
-        left_linear_mps = left_speed_cmd * WHEEL_RADIUS_M
-        right_linear_mps = right_speed_cmd * WHEEL_RADIUS_M
-        forward_mps = 0.5 * (left_linear_mps + right_linear_mps)
-        yaw_rate_rps = (right_linear_mps - left_linear_mps) / AXLE_LENGTH_M
-
-        robot_theta_rad = normalize_angle(robot_theta_rad + yaw_rate_rps * dt_s)
-        robot_x_m += forward_mps * math.cos(robot_theta_rad) * dt_s
-        robot_y_m += forward_mps * math.sin(robot_theta_rad) * dt_s
+        # Update wheel odometry from the previous motor command.
+        (
+            robot_x_m,
+            robot_y_m,
+            robot_theta_rad,
+            distance_delta_m,
+            turn_delta_rad,
+        ) = integrate_odometry_pose(
+            robot_x_m,
+            robot_y_m,
+            robot_theta_rad,
+            left_speed_cmd,
+            right_speed_cmd,
+            dt_s,
+        )
+        odometry_distance_since_correction_m += distance_delta_m
+        odometry_turn_since_correction_rad += turn_delta_rad
 
         # Read all proximity sensor values
         values = [s.getValue() for s in sensors]
@@ -625,6 +732,16 @@ def run():
                             receiver.nextPacket()
                             continue
 
+                        correction_source = command_message.get(
+                            "source",
+                            "supervisor",
+                        )
+                        try:
+                            correction_blend = float(command_message.get("blend", 1.0))
+                        except (TypeError, ValueError):
+                            correction_blend = 1.0
+                        correction_blend = clamp(correction_blend, 0.0, 1.0)
+
                         position_error_m = math.hypot(
                             corrected_x_m - robot_x_m,
                             corrected_y_m - robot_y_m,
@@ -640,16 +757,25 @@ def run():
                             >= POSE_CORRECTION_LOG_INTERVAL_STEPS
                         )
 
-                        robot_x_m = corrected_x_m
-                        robot_y_m = corrected_y_m
-                        robot_theta_rad = corrected_theta_rad
+                        robot_x_m += correction_blend * (corrected_x_m - robot_x_m)
+                        robot_y_m += correction_blend * (corrected_y_m - robot_y_m)
+                        robot_theta_rad = normalize_angle(
+                            robot_theta_rad
+                            + correction_blend
+                            * normalize_angle(corrected_theta_rad - robot_theta_rad)
+                        )
+                        odometry_distance_since_correction_m *= 1.0 - correction_blend
+                        odometry_turn_since_correction_rad *= 1.0 - correction_blend
+                        pose_correction_count += 1
+                        last_pose_correction_source = correction_source
 
                         if should_log_pose_correction:
                             last_pose_correction_log_step = step_count
                             print(
-                                f"[{robot_name}] Pose corrected by supervisor: "
+                                f"[{robot_name}] Pose corrected by {correction_source}: "
                                 f"position_error={position_error_m:.2f}m "
-                                f"heading_error={heading_error_rad:.2f}rad"
+                                f"heading_error={heading_error_rad:.2f}rad "
+                                f"blend={correction_blend:.2f}"
                             )
                 else:
                     print(f"[{robot_name}] Supervisor command received: {command}")
@@ -665,13 +791,30 @@ def run():
                 )
                 valid_hit = LIDAR_MIN_VALID_HIT_M <= lidar_distance_m <= LIDAR_MAX_VALID_HIT_M
                 if mapping_enabled and valid_hit:
-                    hit_x_m = robot_x_m + lidar_distance_m * math.cos(robot_theta_rad)
-                    hit_y_m = robot_y_m + lidar_distance_m * math.sin(robot_theta_rad)
-                    free_updates = occupancy_grid.mark_free_line(
+                    free_distance_m = max(
+                        0.0,
+                        lidar_distance_m - LIDAR_WALL_CLEARANCE_M,
+                    )
+                    free_updates = 0
+                    for ray_start_x_m, ray_start_y_m, ray_end_x_m, ray_end_y_m in (
+                        lidar_free_ray_endpoints(
+                            robot_x_m,
+                            robot_y_m,
+                            robot_theta_rad,
+                            free_distance_m,
+                        )
+                    ):
+                        free_updates += occupancy_grid.mark_free_line(
+                            ray_start_x_m,
+                            ray_start_y_m,
+                            ray_end_x_m,
+                            ray_end_y_m,
+                        )
+                    hit_x_m, hit_y_m = lidar_wall_hit_point(
                         robot_x_m,
                         robot_y_m,
-                        hit_x_m,
-                        hit_y_m,
+                        robot_theta_rad,
+                        lidar_distance_m,
                     )
                     marked = occupancy_grid.mark_wall(hit_x_m, hit_y_m)
                     last_wall_hit = {
@@ -680,7 +823,10 @@ def run():
                         "distance_m": round(lidar_distance_m, 3),
                     }
                     update_tag = "new" if marked else "repeat"
-                    if should_log_lidar(f"wall:{update_tag}"):
+                    if should_log_lidar(
+                        f"wall:{update_tag}",
+                        important=marked,
+                    ):
                         print(
                             f"[{robot_name}] lidar={lidar_value:.1f} "
                             f"dist={lidar_distance_m:.3f}m "
@@ -698,14 +844,21 @@ def run():
             else:
                 logged_clear = False
                 if mapping_enabled:
-                    clear_x_m = robot_x_m + LIDAR_MAX_VALID_HIT_M * math.cos(robot_theta_rad)
-                    clear_y_m = robot_y_m + LIDAR_MAX_VALID_HIT_M * math.sin(robot_theta_rad)
-                    free_updates = occupancy_grid.mark_free_line(
-                        robot_x_m,
-                        robot_y_m,
-                        clear_x_m,
-                        clear_y_m,
-                    )
+                    free_updates = 0
+                    for ray_start_x_m, ray_start_y_m, ray_end_x_m, ray_end_y_m in (
+                        lidar_free_ray_endpoints(
+                            robot_x_m,
+                            robot_y_m,
+                            robot_theta_rad,
+                            LIDAR_MAX_VALID_HIT_M,
+                        )
+                    ):
+                        free_updates += occupancy_grid.mark_free_line(
+                            ray_start_x_m,
+                            ray_start_y_m,
+                            ray_end_x_m,
+                            ray_end_y_m,
+                        )
                     if free_updates > 0 and should_log_lidar("clear_free"):
                         print(
                             f"[{robot_name}] lidar={lidar_value:.1f} "
@@ -932,6 +1085,10 @@ def run():
 
         if emitter is not None and step_count % COMMUNICATION_SEND_INTERVAL_STEPS == 0:
             map_update = occupancy_grid.drain_pending_updates()
+            pose_confidence = pose_confidence_from_odometry(
+                odometry_distance_since_correction_m,
+                odometry_turn_since_correction_rad,
+            )
             message = {
                 "type": "robot_status",
                 "robot": robot_name,
@@ -949,6 +1106,19 @@ def run():
                 },
                 "phase": current_phase,
                 "mapping_enabled": mapping_enabled,
+                "localization": {
+                    "source": last_pose_correction_source,
+                    "confidence": pose_confidence,
+                    "distance_since_correction_m": round(
+                        odometry_distance_since_correction_m,
+                        3,
+                    ),
+                    "turn_since_correction_rad": round(
+                        odometry_turn_since_correction_rad,
+                        3,
+                    ),
+                    "pose_correction_count": pose_correction_count,
+                },
                 "assigned_room": assigned_room,
                 "assignment_target_reached": assignment_target_reached,
                 "assignment_route": {
