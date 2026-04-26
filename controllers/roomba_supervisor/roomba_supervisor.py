@@ -34,6 +34,8 @@ CLEANUP_TARGETS_PER_ROBOT = 8
 ROBOT_STUCK_WINDOW_STEPS = 300
 ROBOT_STUCK_MIN_MOVE_M = 0.08
 ROBOT_STUCK_ALERT_COOLDOWN_STEPS = 450
+ROBOT_RECOVERY_REVERSE_STEPS = 18
+ROBOT_RECOVERY_TURN_STEPS = 24
 ROOM_PROGRESS_STALL_STEPS = 600
 ROOM_PROGRESS_MIN_DELTA_PERCENT = 0.1
 ROOM_PROGRESS_ALERT_COOLDOWN_STEPS = 600
@@ -422,13 +424,32 @@ class TaskAllocator:
         return best_assignments or {}
 
 
-def generate_coverage_waypoints(room):
-    """Create simple back-and-forth sweep waypoints for one room."""
+def normalized_lane(lane_index=0, lane_count=1):
+    """Return a safe lane index/count pair."""
+    try:
+        lane_index = int(lane_index)
+        lane_count = int(lane_count)
+    except (TypeError, ValueError):
+        return 0, 1
+
+    lane_count = max(1, lane_count)
+    lane_index = max(0, min(lane_count - 1, lane_index))
+    return lane_index, lane_count
+
+
+def generate_coverage_waypoints(room, lane_index=0, lane_count=1):
+    """Create simple back-and-forth sweep waypoints for one room or lane."""
     min_x, max_x, min_y, max_y = ROOM_TASKS[room]["bounds"]
     sweep_min_x = min_x + COVERAGE_MARGIN_M
     sweep_max_x = max_x - COVERAGE_MARGIN_M
     sweep_min_y = min_y + COVERAGE_MARGIN_M
     sweep_max_y = max_y - COVERAGE_MARGIN_M
+    lane_index, lane_count = normalized_lane(lane_index, lane_count)
+    sweep_width_m = sweep_max_x - sweep_min_x
+    if lane_count > 1 and sweep_width_m > 0.0:
+        lane_width_m = sweep_width_m / lane_count
+        sweep_min_x += lane_width_m * lane_index
+        sweep_max_x = sweep_min_x + lane_width_m
 
     waypoints = []
     row_positions = []
@@ -448,6 +469,28 @@ def generate_coverage_waypoints(room):
             waypoints.append([round(sweep_min_x, 3), round(y_m, 3)])
 
     return waypoints
+
+
+def room_robot_names(room_assignments, room):
+    """Return robots currently assigned to one room in a stable order."""
+    return sorted(
+        robot_name
+        for robot_name, assignment in room_assignments.items()
+        if assignment is not None and assignment["room"] == room
+    )
+
+
+def coverage_lane_for_robot(robot_name, room_assignments):
+    """Return the sweep lane assigned to one robot inside its current room."""
+    assignment = room_assignments.get(robot_name)
+    if assignment is None:
+        return 0, 1
+
+    robots_in_room = room_robot_names(room_assignments, assignment["room"])
+    if robot_name not in robots_in_room:
+        return 0, 1
+
+    return robots_in_room.index(robot_name), len(robots_in_room)
 
 
 def get_actual_robot_pose(supervisor, robot_name):
@@ -988,10 +1031,12 @@ def select_robot_for_stalled_room(
             continue
 
         source_room = assignment["room"]
-        if active_room_counts.get(source_room, 0) <= 1:
+        source_progress = cleaning_overlay.room_progress_percent(source_room)
+        source_count = active_room_counts.get(source_room, 0)
+        source_target_count = target_robot_count_for_room(source_room)
+        if source_count <= source_target_count:
             continue
 
-        source_progress = cleaning_overlay.room_progress_percent(source_room)
         candidate = (-source_progress, robot_name)
         if assignment.get("helper", False):
             helper_candidates.append(candidate)
@@ -1114,6 +1159,32 @@ def select_reassignment_room(
     return candidate_rooms[0][2]
 
 
+def select_stuck_recovery_room(
+    robot_name,
+    room_assignments,
+    completed_rooms,
+    cleaning_overlay,
+):
+    """Keep a stuck robot focused on its room unless that room is already done."""
+    assignment = room_assignments.get(robot_name)
+    if assignment is None:
+        return None
+
+    room = assignment["room"]
+    if (
+        room not in completed_rooms
+        and not room_reached_coverage_goal(cleaning_overlay, room)
+    ):
+        return room
+
+    return select_reassignment_room(
+        robot_name,
+        room_assignments,
+        completed_rooms,
+        cleaning_overlay,
+    )
+
+
 def build_assignment(robot_status, room, helper=False):
     """Create one assignment dictionary from the robot pose to a room."""
     room_x_m, room_y_m = ROOM_TASKS[room]["center"]
@@ -1130,7 +1201,13 @@ def build_assignment(robot_status, room, helper=False):
     }
 
 
-def send_assignment_commands(emitter, robot_name, assignment):
+def send_assignment_commands(
+    emitter,
+    robot_name,
+    assignment,
+    room_assignments=None,
+    send_coverage=True,
+):
     """Send the room target and coverage path to one robot."""
     emitter.send(
         json.dumps(
@@ -1144,13 +1221,44 @@ def send_assignment_commands(emitter, robot_name, assignment):
             }
         )
     )
-    coverage_plan = generate_coverage_waypoints(assignment["room"])
-    send_coverage_plan(emitter, robot_name, assignment["room"], coverage_plan)
+    if not send_coverage:
+        return []
+
+    lane_index = 0
+    lane_count = 1
+    if room_assignments is not None:
+        lane_index, lane_count = coverage_lane_for_robot(
+            robot_name,
+            room_assignments,
+        )
+    coverage_plan = generate_coverage_waypoints(
+        assignment["room"],
+        lane_index,
+        lane_count,
+    )
+    send_coverage_plan(
+        emitter,
+        robot_name,
+        assignment["room"],
+        coverage_plan,
+        plan_kind="sweep",
+        lane_index=lane_index,
+        lane_count=lane_count,
+    )
     return coverage_plan
 
 
-def send_coverage_plan(emitter, robot_name, room, coverage_plan):
+def send_coverage_plan(
+    emitter,
+    robot_name,
+    room,
+    coverage_plan,
+    plan_kind="sweep",
+    lane_index=0,
+    lane_count=1,
+):
     """Send coverage waypoints to one robot."""
+    lane_index, lane_count = normalized_lane(lane_index, lane_count)
     emitter.send(
         json.dumps(
             {
@@ -1158,10 +1266,59 @@ def send_coverage_plan(emitter, robot_name, room, coverage_plan):
                 "robot": robot_name,
                 "room": room,
                 "waypoints": coverage_plan,
+                "plan_kind": plan_kind,
+                "lane_index": lane_index,
+                "lane_count": lane_count,
             }
         )
     )
     return coverage_plan
+
+
+def send_room_coverage_plans(
+    emitter,
+    room_assignments,
+    room,
+    cleaning_overlay=None,
+    cleanup_plan_signatures=None,
+):
+    """Resend split sweep lanes to every robot currently assigned to one room."""
+    coverage_plans = {}
+    for robot_name in room_robot_names(room_assignments, room):
+        lane_index, lane_count = coverage_lane_for_robot(
+            robot_name,
+            room_assignments,
+        )
+        coverage_plan = generate_coverage_waypoints(room, lane_index, lane_count)
+        if cleanup_plan_signatures is not None:
+            cleanup_plan_signatures.pop(robot_name, None)
+        if cleaning_overlay is not None:
+            cleaning_overlay.release_robot_claims(robot_name)
+        coverage_plans[robot_name] = send_coverage_plan(
+            emitter,
+            robot_name,
+            room,
+            coverage_plan,
+            plan_kind="sweep",
+            lane_index=lane_index,
+            lane_count=lane_count,
+        )
+    return coverage_plans
+
+
+def send_recovery_command(emitter, robot_name, reason):
+    """Ask one robot to back up and turn before trying its route again."""
+    emitter.send(
+        json.dumps(
+            {
+                "type": "recovery",
+                "robot": robot_name,
+                "reason": reason,
+                "reverse_steps": ROBOT_RECOVERY_REVERSE_STEPS,
+                "turn_steps": ROBOT_RECOVERY_TURN_STEPS,
+            }
+        )
+    )
 
 
 def send_idle_command(emitter, robot_name):
@@ -1304,6 +1461,7 @@ def run():
                         emitter,
                         robot_name,
                         assignment,
+                        room_assignments,
                     )
                     print(
                         f"[supervisor] Assigned {robot_name} -> "
@@ -1334,17 +1492,12 @@ def run():
                     continue
 
                 room = assignment["room"]
-                next_room = select_reassignment_room(
+                next_room = select_stuck_recovery_room(
                     robot_name,
                     room_assignments,
                     completed_rooms,
                     cleaning_overlay,
                 )
-                if next_room is None and not room_reached_coverage_goal(
-                    cleaning_overlay,
-                    room,
-                ):
-                    next_room = room
                 if next_room is None:
                     continue
 
@@ -1352,18 +1505,42 @@ def run():
                 cleanup_plan_signatures.pop(robot_name, None)
                 last_cleaning_poses.pop(robot_name, None)
                 completed_robot_rooms.pop(robot_name, None)
-                next_assignment = build_assignment(status, next_room, helper=True)
+                send_recovery_command(emitter, robot_name, stuck_reason)
+                helper = assignment.get("helper", False) or next_room != room
+                next_assignment = build_assignment(status, next_room, helper=helper)
                 room_assignments[robot_name] = next_assignment
                 cleaning_overlay.show_dirty_room(next_room)
-                coverage_plans[robot_name] = send_assignment_commands(
+                send_assignment_commands(
                     emitter,
                     robot_name,
                     next_assignment,
+                    room_assignments,
+                    send_coverage=False,
                 )
+                coverage_plans.update(
+                    send_room_coverage_plans(
+                        emitter,
+                        room_assignments,
+                        next_room,
+                        cleaning_overlay,
+                        cleanup_plan_signatures,
+                    )
+                )
+                if room != next_room:
+                    coverage_plans.update(
+                        send_room_coverage_plans(
+                            emitter,
+                            room_assignments,
+                            room,
+                            cleaning_overlay,
+                            cleanup_plan_signatures,
+                        )
+                    )
                 robot_motion_monitors.pop(robot_name, None)
                 print(
                     f"[supervisor] {robot_name} appears stuck "
-                    f"({stuck_reason}); rerouting to {next_room}"
+                    f"({stuck_reason}); sent recovery nudge and "
+                    f"retrying {next_room}"
                 )
 
             progress_snapshot = room_progress_snapshot(cleaning_overlay)
@@ -1422,11 +1599,32 @@ def run():
                 room_assignments[robot_to_redirect] = next_assignment
                 redirected_robots.add(robot_to_redirect)
                 cleaning_overlay.show_dirty_room(redirect_room)
-                coverage_plans[robot_to_redirect] = send_assignment_commands(
+                send_assignment_commands(
                     emitter,
                     robot_to_redirect,
                     next_assignment,
+                    room_assignments,
+                    send_coverage=False,
                 )
+                coverage_plans.update(
+                    send_room_coverage_plans(
+                        emitter,
+                        room_assignments,
+                        redirect_room,
+                        cleaning_overlay,
+                        cleanup_plan_signatures,
+                    )
+                )
+                if previous_room != "idle" and previous_room != redirect_room:
+                    coverage_plans.update(
+                        send_room_coverage_plans(
+                            emitter,
+                            room_assignments,
+                            previous_room,
+                            cleaning_overlay,
+                            cleanup_plan_signatures,
+                        )
+                    )
                 robot_motion_monitors.pop(robot_to_redirect, None)
                 print(
                     f"[supervisor] Room {stalled_room} progress stalled at "
@@ -1473,6 +1671,7 @@ def run():
                             robot_name,
                             room,
                             cleanup_plan,
+                            plan_kind="cleanup",
                         )
                         cleanup_plan_signatures[robot_name] = cleanup_signature
                         print(
@@ -1517,10 +1716,21 @@ def run():
                 next_assignment = build_assignment(status, next_room, helper=True)
                 room_assignments[robot_name] = next_assignment
                 cleaning_overlay.show_dirty_room(next_room)
-                coverage_plans[robot_name] = send_assignment_commands(
+                send_assignment_commands(
                     emitter,
                     robot_name,
                     next_assignment,
+                    room_assignments,
+                    send_coverage=False,
+                )
+                coverage_plans.update(
+                    send_room_coverage_plans(
+                        emitter,
+                        room_assignments,
+                        next_room,
+                        cleaning_overlay,
+                        cleanup_plan_signatures,
+                    )
                 )
                 cleanup_plan_signatures.pop(robot_name, None)
                 cleaning_overlay.release_robot_claims(robot_name)
@@ -1557,6 +1767,11 @@ def run():
                     if assignment.get("helper", False):
                         room += " (helping)"
                 coverage = status.get("coverage", {})
+                plan_kind = coverage.get("plan_kind", "sweep")
+                lane_index, lane_count = normalized_lane(
+                    coverage.get("lane_index", 0),
+                    coverage.get("lane_count", 1),
+                )
                 room_progress = 0.0
                 if assignment is not None:
                     room_progress = cleaning_overlay.room_progress_percent(
@@ -1572,9 +1787,11 @@ def run():
                     f"[supervisor]   {robot_name}: "
                     f"{pose_text}"
                     f"launch={launch['waypoint_index']}/{launch['waypoint_count']} "
+                    f"phase={status.get('phase', 'unknown')} "
                     f"room={room} "
                     f"coverage={coverage.get('waypoint_index', 0)}/"
                     f"{coverage.get('waypoint_count', 0)} "
+                    f"{plan_kind} lane={lane_index + 1}/{lane_count} "
                     f"clean={room_progress:.1f}% "
                     f"free={status.get('free_cell_count', 0)} "
                     f"walls={status['wall_cell_count']}"
