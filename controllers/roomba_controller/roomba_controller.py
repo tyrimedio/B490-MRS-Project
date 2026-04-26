@@ -442,6 +442,7 @@ def robot_phase(
     assignment_target_reached,
     coverage_complete,
     coverage_plan_kind,
+    assignment_wait_steps_remaining=0,
 ):
     """Return a plain-language state name for logs and supervisor status."""
     if not launch_finished and not launch_timed_out:
@@ -449,6 +450,8 @@ def robot_phase(
     if assigned_target is None:
         return "waiting_for_assignment"
     if not assignment_target_reached:
+        if assignment_wait_steps_remaining > 0:
+            return "waiting_for_route"
         return "driving_to_room"
     if coverage_complete:
         return "holding_after_task"
@@ -546,6 +549,9 @@ def run():
     assignment_route = []
     assignment_route_index = 0
     assignment_target_reached = False
+    assignment_start_delay_steps = 0
+    assignment_wait_steps_remaining = 0
+    assignment_planned_distance_m = 0.0
     coverage_room = None
     coverage_waypoints = []
     coverage_waypoint_index = 0
@@ -629,15 +635,36 @@ def run():
                                 assignment_route = [assigned_target]
                             assignment_route_index = 0
                             assignment_target_reached = False
+                            try:
+                                assignment_start_delay_steps = max(
+                                    0,
+                                    int(command_message.get("start_delay_steps", 0)),
+                                )
+                            except (TypeError, ValueError):
+                                assignment_start_delay_steps = 0
+                            assignment_wait_steps_remaining = (
+                                assignment_start_delay_steps
+                            )
+                            path_metrics = command_message.get("path_metrics", {})
+                            try:
+                                assignment_planned_distance_m = float(
+                                    path_metrics.get("planned_distance_m", 0.0)
+                                )
+                            except (AttributeError, TypeError, ValueError):
+                                assignment_planned_distance_m = 0.0
                         else:
                             assigned_target = None
                             assignment_route = []
                             assignment_route_index = 0
                             assignment_target_reached = False
+                            assignment_start_delay_steps = 0
+                            assignment_wait_steps_remaining = 0
+                            assignment_planned_distance_m = 0.0
                         print(
                             f"[{robot_name}] Assigned to room "
                             f"{assigned_room} via {len(assignment_route)} "
-                            "route waypoint(s)"
+                            f"route waypoint(s), "
+                            f"wait={assignment_start_delay_steps} step(s)"
                         )
                 elif command_message.get("type") == "idle":
                     target_robot = command_message.get("robot")
@@ -647,6 +674,9 @@ def run():
                         assignment_route = []
                         assignment_route_index = 0
                         assignment_target_reached = False
+                        assignment_start_delay_steps = 0
+                        assignment_wait_steps_remaining = 0
+                        assignment_planned_distance_m = 0.0
                         coverage_room = None
                         coverage_waypoints = []
                         coverage_waypoint_index = 0
@@ -904,6 +934,7 @@ def run():
 
         assignment_left_speed = None
         assignment_right_speed = None
+        assignment_waiting_this_step = False
         launch_finished = launch_waypoint_index >= len(launch_waypoints)
         if (
             assigned_target is not None
@@ -911,29 +942,33 @@ def run():
             and not assignment_target_reached
             and (launch_finished or launch_timed_out)
         ):
-            target_x_m, target_y_m = assignment_route[assignment_route_index]
-            delta_x_m = target_x_m - robot_x_m
-            delta_y_m = target_y_m - robot_y_m
-            target_distance_m = math.hypot(delta_x_m, delta_y_m)
-
-            if target_distance_m <= ASSIGNMENT_TARGET_REACHED_M:
-                assignment_route_index += 1
-                if assignment_route_index >= len(assignment_route):
-                    assignment_target_reached = True
-                    print(f"[{robot_name}] Reached assigned room {assigned_room}")
-                else:
-                    print(
-                        f"[{robot_name}] Assignment route waypoint "
-                        f"{assignment_route_index}/{len(assignment_route)} reached"
-                    )
+            if assignment_wait_steps_remaining > 0:
+                assignment_waiting_this_step = True
+                assignment_wait_steps_remaining -= 1
             else:
-                assignment_left_speed, assignment_right_speed = drive_toward_target(
-                    robot_x_m,
-                    robot_y_m,
-                    robot_theta_rad,
-                    target_x_m,
-                    target_y_m,
-                )
+                target_x_m, target_y_m = assignment_route[assignment_route_index]
+                delta_x_m = target_x_m - robot_x_m
+                delta_y_m = target_y_m - robot_y_m
+                target_distance_m = math.hypot(delta_x_m, delta_y_m)
+
+                if target_distance_m <= ASSIGNMENT_TARGET_REACHED_M:
+                    assignment_route_index += 1
+                    if assignment_route_index >= len(assignment_route):
+                        assignment_target_reached = True
+                        print(f"[{robot_name}] Reached assigned room {assigned_room}")
+                    else:
+                        print(
+                            f"[{robot_name}] Assignment route waypoint "
+                            f"{assignment_route_index}/{len(assignment_route)} reached"
+                        )
+                else:
+                    assignment_left_speed, assignment_right_speed = drive_toward_target(
+                        robot_x_m,
+                        robot_y_m,
+                        robot_theta_rad,
+                        target_x_m,
+                        target_y_m,
+                    )
 
         coverage_left_speed = None
         coverage_right_speed = None
@@ -997,6 +1032,10 @@ def run():
             coverage_complete,
         ):
             # Hold position after finishing the current room until reassigned.
+            left_speed = 0.0
+            right_speed = 0.0
+        elif assignment_waiting_this_step and not assignment_target_reached:
+            # The supervisor staggered this route to keep shared doorways clear.
             left_speed = 0.0
             right_speed = 0.0
         elif escape_reverse_steps > 0 and not rear_blocked:
@@ -1078,6 +1117,7 @@ def run():
             assignment_target_reached,
             coverage_complete,
             coverage_plan_kind,
+            assignment_wait_steps_remaining,
         )
         if current_phase != last_robot_phase:
             last_robot_phase = current_phase
@@ -1124,6 +1164,9 @@ def run():
                 "assignment_route": {
                     "waypoint_index": assignment_route_index,
                     "waypoint_count": len(assignment_route),
+                    "start_delay_steps": assignment_start_delay_steps,
+                    "waiting_steps_remaining": assignment_wait_steps_remaining,
+                    "planned_distance_m": round(assignment_planned_distance_m, 3),
                 },
                 "coverage": {
                     "room": coverage_room,
