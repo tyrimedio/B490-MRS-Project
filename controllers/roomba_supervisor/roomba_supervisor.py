@@ -31,6 +31,11 @@ CLEAN_TILE_SIZE_M = 0.25
 CLEAN_RADIUS_M = 0.18
 CLEAN_TRAIL_SAMPLE_SPACING_M = 0.08
 CLEANUP_TARGETS_PER_ROBOT = 8
+FINAL_CLEANUP_DIRTY_TILE_COUNT = 4
+FINAL_CLEANUP_PROGRESS_PERCENT = 95.0
+STALLED_CLEANUP_PROGRESS_PERCENT = 90.0
+CLEANUP_RESEND_STEPS = 240
+CLEANUP_EDGE_PRIORITY_MARGIN_M = 0.35
 ROBOT_STUCK_WINDOW_STEPS = 300
 ROBOT_STUCK_MIN_MOVE_M = 0.08
 ROBOT_STUCK_ALERT_COOLDOWN_STEPS = 450
@@ -748,6 +753,7 @@ class CleaningOverlay:
         robot_name,
         robot_pose=None,
         max_tiles=CLEANUP_TARGETS_PER_ROBOT,
+        prefer_edges=False,
     ):
         """
         Reserve a small cleanup batch for one robot.
@@ -785,7 +791,33 @@ class CleaningOverlay:
                     center_y_m - robot_pose["y_m"],
                 )
             _, col_index, row_index = tile_key
-            return (distance_m, row_index, col_index)
+            if not prefer_edges:
+                return (distance_m, row_index, col_index)
+
+            min_x, max_x, min_y, max_y = self.rooms[room]["bounds"]
+            edge_distance_m = min(
+                center_x_m - min_x,
+                max_x - center_x_m,
+                center_y_m - min_y,
+                max_y - center_y_m,
+            )
+            corner_distance_m = min(
+                math.hypot(center_x_m - corner_x_m, center_y_m - corner_y_m)
+                for corner_x_m, corner_y_m in (
+                    (min_x, min_y),
+                    (min_x, max_y),
+                    (max_x, min_y),
+                    (max_x, max_y),
+                )
+            )
+            is_edge_tile = edge_distance_m <= CLEANUP_EDGE_PRIORITY_MARGIN_M
+            return (
+                0 if is_edge_tile else 1,
+                corner_distance_m,
+                distance_m,
+                row_index,
+                col_index,
+            )
 
         selected_tiles = sorted(claimed_by_robot, key=sort_key)
         selected_tiles.extend(
@@ -802,6 +834,30 @@ class CleaningOverlay:
 def room_reached_coverage_goal(cleaning_overlay, room):
     """Return True when no visible cleaning tiles remain dirty."""
     return cleaning_overlay.dirty_tile_count(room) == 0
+
+
+def cleanup_trigger_reason(
+    cleaning_overlay,
+    room,
+    coverage_done_for_room,
+    room_stalled=False,
+):
+    """Return why a robot should switch from sweep to cleanup, or None."""
+    dirty_count = cleaning_overlay.dirty_tile_count(room)
+    if dirty_count <= 0:
+        return None
+
+    progress_percent = cleaning_overlay.room_progress_percent(room)
+    if coverage_done_for_room:
+        return f"sweep complete; {dirty_count} dirty tile(s) remain"
+    if dirty_count <= FINAL_CLEANUP_DIRTY_TILE_COUNT:
+        return f"final {dirty_count} dirty tile(s) remain"
+    if progress_percent >= FINAL_CLEANUP_PROGRESS_PERCENT:
+        return f"room is {progress_percent:.1f}% clean"
+    if room_stalled and progress_percent >= STALLED_CLEANUP_PROGRESS_PERCENT:
+        return f"room stalled at {progress_percent:.1f}% clean"
+
+    return None
 
 
 def room_progress_snapshot(cleaning_overlay):
@@ -1281,6 +1337,7 @@ def send_room_coverage_plans(
     room,
     cleaning_overlay=None,
     cleanup_plan_signatures=None,
+    cleanup_plan_steps=None,
 ):
     """Resend split sweep lanes to every robot currently assigned to one room."""
     coverage_plans = {}
@@ -1292,6 +1349,8 @@ def send_room_coverage_plans(
         coverage_plan = generate_coverage_waypoints(room, lane_index, lane_count)
         if cleanup_plan_signatures is not None:
             cleanup_plan_signatures.pop(robot_name, None)
+        if cleanup_plan_steps is not None:
+            cleanup_plan_steps.pop(robot_name, None)
         if cleaning_overlay is not None:
             cleaning_overlay.release_robot_claims(robot_name)
         coverage_plans[robot_name] = send_coverage_plan(
@@ -1319,6 +1378,55 @@ def send_recovery_command(emitter, robot_name, reason):
             }
         )
     )
+
+
+def send_cleanup_plan_if_needed(
+    emitter,
+    cleaning_overlay,
+    robot_name,
+    room,
+    pose,
+    cleanup_plan_signatures,
+    cleanup_plan_steps,
+    step_count,
+    reason,
+):
+    """Send a cleanup pass when the robot has new or stale dirty-tile targets."""
+    cleanup_plan = cleaning_overlay.claim_dirty_tile_centers(
+        room,
+        robot_name,
+        pose,
+        prefer_edges=True,
+    )
+    if not cleanup_plan:
+        return None
+
+    cleanup_signature = (
+        room,
+        tuple(tuple(waypoint) for waypoint in cleanup_plan),
+    )
+    previous_step = cleanup_plan_steps.get(robot_name)
+    resend_due = (
+        previous_step is not None
+        and step_count - previous_step >= CLEANUP_RESEND_STEPS
+    )
+    if cleanup_plan_signatures.get(robot_name) == cleanup_signature and not resend_due:
+        return None
+
+    cleanup_plan_steps[robot_name] = step_count
+    cleanup_plan_signatures[robot_name] = cleanup_signature
+    send_coverage_plan(
+        emitter,
+        robot_name,
+        room,
+        cleanup_plan,
+        plan_kind="cleanup",
+    )
+    print(
+        f"[supervisor] Sent {robot_name} cleanup pass for {room}: "
+        f"{len(cleanup_plan)} claimed dirty tile(s); reason={reason}"
+    )
+    return cleanup_plan
 
 
 def send_idle_command(emitter, robot_name):
@@ -1352,6 +1460,7 @@ def run():
     room_assignments = {}
     coverage_plans = {}
     cleanup_plan_signatures = {}
+    cleanup_plan_steps = {}
     robot_motion_monitors = {}
     room_progress_monitors = {}
     completed_rooms = set()
@@ -1503,6 +1612,7 @@ def run():
 
                 cleaning_overlay.release_robot_claims(robot_name)
                 cleanup_plan_signatures.pop(robot_name, None)
+                cleanup_plan_steps.pop(robot_name, None)
                 last_cleaning_poses.pop(robot_name, None)
                 completed_robot_rooms.pop(robot_name, None)
                 send_recovery_command(emitter, robot_name, stuck_reason)
@@ -1524,6 +1634,7 @@ def run():
                         next_room,
                         cleaning_overlay,
                         cleanup_plan_signatures,
+                        cleanup_plan_steps,
                     )
                 )
                 if room != next_room:
@@ -1534,6 +1645,7 @@ def run():
                             room,
                             cleaning_overlay,
                             cleanup_plan_signatures,
+                            cleanup_plan_steps,
                         )
                     )
                 robot_motion_monitors.pop(robot_name, None)
@@ -1556,6 +1668,7 @@ def run():
                     room_assignments,
                 ),
             )
+            stalled_room_set = set(stalled_rooms)
             redirected_robots = set()
             for stalled_room in stalled_rooms:
                 redirect_room = select_redirect_room_for_stalled_progress(
@@ -1589,6 +1702,7 @@ def run():
                     previous_room = previous_assignment["room"]
                 cleaning_overlay.release_robot_claims(robot_to_redirect)
                 cleanup_plan_signatures.pop(robot_to_redirect, None)
+                cleanup_plan_steps.pop(robot_to_redirect, None)
                 last_cleaning_poses.pop(robot_to_redirect, None)
                 completed_robot_rooms.pop(robot_to_redirect, None)
                 next_assignment = build_assignment(
@@ -1613,6 +1727,7 @@ def run():
                         redirect_room,
                         cleaning_overlay,
                         cleanup_plan_signatures,
+                        cleanup_plan_steps,
                     )
                 )
                 if previous_room != "idle" and previous_room != redirect_room:
@@ -1623,6 +1738,7 @@ def run():
                             previous_room,
                             cleaning_overlay,
                             cleanup_plan_signatures,
+                            cleanup_plan_steps,
                         )
                     )
                 robot_motion_monitors.pop(robot_to_redirect, None)
@@ -1645,45 +1761,36 @@ def run():
                     coverage.get("room") == room
                     and coverage.get("complete", False)
                 )
-                if (
-                    coverage_done_for_room
-                    and not room_reached_coverage_goal(cleaning_overlay, room)
-                ):
+                cleanup_reason = cleanup_trigger_reason(
+                    cleaning_overlay,
+                    room,
+                    coverage_done_for_room,
+                    room in stalled_room_set,
+                )
+                if cleanup_reason is not None:
                     pose = get_actual_robot_pose(supervisor, robot_name)
                     if pose is None:
                         pose = status["pose"]
-                    cleanup_plan = cleaning_overlay.claim_dirty_tile_centers(
-                        room,
+                    cleanup_plan = send_cleanup_plan_if_needed(
+                        emitter,
+                        cleaning_overlay,
                         robot_name,
-                        pose,
-                    )
-                    cleanup_signature = (
                         room,
-                        tuple(tuple(waypoint) for waypoint in cleanup_plan),
+                        pose,
+                        cleanup_plan_signatures,
+                        cleanup_plan_steps,
+                        step_count,
+                        cleanup_reason,
                     )
-                    if (
-                        cleanup_plan
-                        and cleanup_plan_signatures.get(robot_name)
-                        != cleanup_signature
-                    ):
-                        coverage_plans[robot_name] = send_coverage_plan(
-                            emitter,
-                            robot_name,
-                            room,
-                            cleanup_plan,
-                            plan_kind="cleanup",
-                        )
-                        cleanup_plan_signatures[robot_name] = cleanup_signature
-                        print(
-                            f"[supervisor] Sent {robot_name} cleanup pass for "
-                            f"{room}: {len(cleanup_plan)} claimed dirty tile(s)"
-                        )
+                    if cleanup_plan is not None:
+                        coverage_plans[robot_name] = cleanup_plan
                     continue
 
                 if not room_reached_coverage_goal(cleaning_overlay, room):
                     continue
 
                 cleanup_plan_signatures.pop(robot_name, None)
+                cleanup_plan_steps.pop(robot_name, None)
                 cleaning_overlay.release_robot_claims(robot_name)
                 if room not in completed_rooms:
                     completed_rooms.add(room)
@@ -1708,9 +1815,13 @@ def run():
                     room_assignments[robot_name] = None
                     coverage_plans[robot_name] = []
                     cleanup_plan_signatures.pop(robot_name, None)
+                    cleanup_plan_steps.pop(robot_name, None)
                     cleaning_overlay.release_robot_claims(robot_name)
                     last_cleaning_poses.pop(robot_name, None)
-                    print(f"[supervisor] {robot_name} has no unfinished room to help")
+                    print(
+                        f"[supervisor] {robot_name} has no unfinished room to help; "
+                        "all visible dirty tiles are clean, holding idle"
+                    )
                     continue
 
                 next_assignment = build_assignment(status, next_room, helper=True)
@@ -1730,9 +1841,11 @@ def run():
                         next_room,
                         cleaning_overlay,
                         cleanup_plan_signatures,
+                        cleanup_plan_steps,
                     )
                 )
                 cleanup_plan_signatures.pop(robot_name, None)
+                cleanup_plan_steps.pop(robot_name, None)
                 cleaning_overlay.release_robot_claims(robot_name)
                 last_cleaning_poses.pop(robot_name, None)
                 print(

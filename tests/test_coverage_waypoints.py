@@ -412,6 +412,102 @@ class CoverageWaypointTests(unittest.TestCase):
         self.assertEqual([[-2.625, 0.875]], plan)
         self.assertEqual({("nw_small", 1, 0): "epuck_1"}, overlay.tile_claims)
 
+    def test_cleanup_claims_can_prioritize_wall_and_corner_tiles(self):
+        supervisor = load_supervisor_module()
+        overlay = supervisor.CleaningOverlay.__new__(supervisor.CleaningOverlay)
+        overlay.rooms = supervisor.ROOM_TASKS
+        overlay.tile_claims = {}
+        overlay.dirty_tiles = {
+            ("nw_small", 0, 0),
+            ("nw_small", 3, 3),
+        }
+
+        plan = overlay.claim_dirty_tile_centers(
+            "nw_small",
+            "epuck_1",
+            {"x_m": -2.12, "y_m": 1.62},
+            max_tiles=1,
+            prefer_edges=True,
+        )
+
+        self.assertEqual([[-2.875, 0.875]], plan)
+        self.assertEqual({("nw_small", 0, 0): "epuck_1"}, overlay.tile_claims)
+
+    def test_cleanup_trigger_reason_starts_final_cleanup_before_sweep_end(self):
+        supervisor = load_supervisor_module()
+        overlay = supervisor.CleaningOverlay.__new__(supervisor.CleaningOverlay)
+        overlay.room_tile_counts = {"nw_small": 100}
+        overlay.dirty_tiles = {
+            ("nw_small", 0, 0),
+            ("nw_small", 1, 0),
+            ("nw_small", 2, 0),
+            ("nw_small", 3, 0),
+        }
+
+        reason = supervisor.cleanup_trigger_reason(
+            overlay,
+            "nw_small",
+            coverage_done_for_room=False,
+            room_stalled=False,
+        )
+
+        self.assertEqual("final 4 dirty tile(s) remain", reason)
+
+    def test_cleanup_trigger_reason_starts_stalled_late_cleanup(self):
+        supervisor = load_supervisor_module()
+        overlay = supervisor.CleaningOverlay.__new__(supervisor.CleaningOverlay)
+        overlay.room_tile_counts = {"nw_small": 100}
+        overlay.dirty_tiles = {
+            ("nw_small", col_index, 0)
+            for col_index in range(7)
+        }
+
+        reason = supervisor.cleanup_trigger_reason(
+            overlay,
+            "nw_small",
+            coverage_done_for_room=False,
+            room_stalled=True,
+        )
+
+        self.assertEqual("room stalled at 93.0% clean", reason)
+
+    def test_cleanup_pass_resends_stale_identical_plan(self):
+        supervisor = load_supervisor_module()
+
+        class FakeEmitter:
+            def __init__(self):
+                self.messages = []
+
+            def send(self, payload):
+                self.messages.append(payload)
+
+        emitter = FakeEmitter()
+        overlay = supervisor.CleaningOverlay.__new__(supervisor.CleaningOverlay)
+        overlay.rooms = supervisor.ROOM_TASKS
+        overlay.tile_claims = {("nw_small", 0, 0): "epuck_1"}
+        overlay.dirty_tiles = {("nw_small", 0, 0)}
+        cleanup_plan_signatures = {
+            "epuck_1": ("nw_small", ((-2.875, 0.875),))
+        }
+        cleanup_plan_steps = {"epuck_1": 10}
+
+        plan = supervisor.send_cleanup_plan_if_needed(
+            emitter,
+            overlay,
+            "epuck_1",
+            "nw_small",
+            {"x_m": -2.8, "y_m": 0.9},
+            cleanup_plan_signatures,
+            cleanup_plan_steps,
+            10 + supervisor.CLEANUP_RESEND_STEPS,
+            "room stalled at 99.0% clean",
+        )
+
+        self.assertEqual([[-2.875, 0.875]], plan)
+        self.assertEqual(1, len(emitter.messages))
+        command = json.loads(emitter.messages[0])
+        self.assertEqual("cleanup", command["plan_kind"])
+
     def test_cleaning_a_tile_releases_its_claim(self):
         supervisor = load_supervisor_module()
 
@@ -1125,6 +1221,11 @@ class CoverageWaypointTests(unittest.TestCase):
             "epuck_2": ("ne_large", ((1.125, 0.875),)),
             "epuck_3": ("s_medium", ((-0.625, -2.875),)),
         }
+        cleanup_plan_steps = {
+            "epuck_1": 10,
+            "epuck_2": 20,
+            "epuck_3": 30,
+        }
         room_assignments = {
             "epuck_1": {"room": "ne_large"},
             "epuck_2": {"room": "ne_large", "helper": True},
@@ -1137,9 +1238,11 @@ class CoverageWaypointTests(unittest.TestCase):
             "ne_large",
             overlay,
             cleanup_plan_signatures,
+            cleanup_plan_steps,
         )
 
         self.assertEqual({"epuck_3"}, set(cleanup_plan_signatures))
+        self.assertEqual({"epuck_3"}, set(cleanup_plan_steps))
         self.assertEqual(
             {("s_medium", 0, 0): "epuck_3"},
             overlay.tile_claims,

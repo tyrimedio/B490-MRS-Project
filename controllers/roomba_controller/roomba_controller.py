@@ -795,7 +795,10 @@ def run():
                 coverage_waypoint_index += 1
                 if coverage_waypoint_index >= len(coverage_waypoints):
                     coverage_complete = True
-                    print(f"[{robot_name}] Coverage complete for {coverage_room}")
+                    print(
+                        f"[{robot_name}] {coverage_plan_kind} complete for "
+                        f"{coverage_room}; waiting for supervisor"
+                    )
                 else:
                     print(
                         f"[{robot_name}] Coverage waypoint "
