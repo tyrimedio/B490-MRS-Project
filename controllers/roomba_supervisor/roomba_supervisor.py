@@ -24,12 +24,15 @@ ROBOT_DEF_NAMES = {
 MRTA_ASSIGNMENT_DELAY_STEPS = 0
 MRTA_DISTANCE_WEIGHT = 1.0
 MRTA_AREA_WEIGHT = 0.05
-COVERAGE_MARGIN_M = 0.125
+COVERAGE_MARGIN_M = 0.2
 COVERAGE_ROW_SPACING_M = 0.35
 COVERAGE_COMPLETE_PERCENT = 100.0
 CLEAN_TILE_SIZE_M = 0.25
 CLEAN_RADIUS_M = 0.18
 CLEAN_TRAIL_SAMPLE_SPACING_M = 0.08
+CLEANUP_TARGETS_PER_ROBOT = 8
+FLOOR_MIN_X_M = -3.0
+FLOOR_MIN_Y_M = -3.0
 DIRTY_TILE_COLOR = [0.72, 0.56, 0.32]
 DIRTY_TILE_TRANSPARENCY = 0.35
 CLEAN_TILE_COLOR = [0.18, 0.62, 0.42]
@@ -503,6 +506,15 @@ def robot_can_mark_cleaning(pose, room):
     )
 
 
+def first_aligned_tile_center(min_m, floor_min_m):
+    """Return the first floor-grid tile center at or after a room edge."""
+    offset_tiles = math.ceil(
+        (min_m - floor_min_m - 0.5 * CLEAN_TILE_SIZE_M) / CLEAN_TILE_SIZE_M
+        - 1e-9
+    )
+    return round(floor_min_m + (offset_tiles + 0.5) * CLEAN_TILE_SIZE_M, 3)
+
+
 class CleaningOverlay:
     """Draw floor tiles that change color as robots clean their rooms."""
 
@@ -511,7 +523,9 @@ class CleaningOverlay:
         self.rooms = rooms
         self.root_children = supervisor.getRoot().getField("children")
         self.tile_appearances = {}
+        self.tile_centers = {}
         self.dirty_tiles = set()
+        self.tile_claims = {}
         self.room_tile_counts = {room: 0 for room in rooms}
         self.active_rooms = set()
         self.enabled = True
@@ -522,10 +536,10 @@ class CleaningOverlay:
         for room, config in self.rooms.items():
             min_x, max_x, min_y, max_y = config["bounds"]
             row_index = 0
-            y_m = min_y + 0.5 * CLEAN_TILE_SIZE_M
+            y_m = first_aligned_tile_center(min_y, FLOOR_MIN_Y_M)
             while y_m < max_y:
                 col_index = 0
-                x_m = min_x + 0.5 * CLEAN_TILE_SIZE_M
+                x_m = first_aligned_tile_center(min_x, FLOOR_MIN_X_M)
                 while x_m < max_x:
                     tile_key = (room, col_index, row_index)
                     def_name = f"CLEAN_TILE_{room}_{col_index}_{row_index}".upper()
@@ -549,6 +563,7 @@ class CleaningOverlay:
                         shape = node.getField("children").getMFNode(0)
                         appearance = shape.getField("appearance").getSFNode()
                         self.tile_appearances[tile_key] = appearance
+                        self.tile_centers[tile_key] = [round(x_m, 3), round(y_m, 3)]
                         self.dirty_tiles.add(tile_key)
                         self.room_tile_counts[room] += 1
                     except Exception as exc:
@@ -589,9 +604,7 @@ class CleaningOverlay:
             if tile_room != room:
                 continue
 
-            min_x, _, min_y, _ = self.rooms[room]["bounds"]
-            tile_x_m = min_x + (col_index + 0.5) * CLEAN_TILE_SIZE_M
-            tile_y_m = min_y + (row_index + 0.5) * CLEAN_TILE_SIZE_M
+            tile_x_m, tile_y_m = self.tile_center(tile_key)
             if math.hypot(tile_x_m - x_m, tile_y_m - y_m) > CLEAN_RADIUS_M:
                 continue
 
@@ -599,6 +612,7 @@ class CleaningOverlay:
             appearance.getField("baseColor").setSFColor(CLEAN_TILE_COLOR)
             appearance.getField("transparency").setSFFloat(CLEAN_TILE_TRANSPARENCY)
             self.dirty_tiles.remove(tile_key)
+            self.tile_claims.pop(tile_key, None)
             cleaned_count += 1
 
         return cleaned_count
@@ -613,6 +627,20 @@ class CleaningOverlay:
     def dirty_tile_count(self, room):
         """Return how many cleaning tiles in one room are still dirty."""
         return sum(1 for tile_room, _, _ in self.dirty_tiles if tile_room == room)
+
+    def tile_center(self, tile_key):
+        """Return the world position of one tile center."""
+        if hasattr(self, "tile_centers") and tile_key in self.tile_centers:
+            return self.tile_centers[tile_key]
+
+        room, col_index, row_index = tile_key
+        min_x, _, min_y, _ = self.rooms[room]["bounds"]
+        start_x_m = first_aligned_tile_center(min_x, FLOOR_MIN_X_M)
+        start_y_m = first_aligned_tile_center(min_y, FLOOR_MIN_Y_M)
+        return [
+            round(start_x_m + col_index * CLEAN_TILE_SIZE_M, 3),
+            round(start_y_m + row_index * CLEAN_TILE_SIZE_M, 3),
+        ]
 
     def cleaned_tile_count(self, room):
         """Return how many cleaning tiles in one room have been cleaned."""
@@ -631,16 +659,93 @@ class CleaningOverlay:
         if room not in self.rooms:
             return []
 
-        min_x, _, min_y, _ = self.rooms[room]["bounds"]
         centers = []
-        for tile_room, col_index, row_index in sorted(self.dirty_tiles):
+        for tile_key in sorted(self.dirty_tiles):
+            tile_room, _, _ = tile_key
             if tile_room != room:
                 continue
-            centers.append([
-                round(min_x + (col_index + 0.5) * CLEAN_TILE_SIZE_M, 3),
-                round(min_y + (row_index + 0.5) * CLEAN_TILE_SIZE_M, 3),
-            ])
+            centers.append(self.tile_center(tile_key))
         return centers
+
+    def release_robot_claims(self, robot_name):
+        """Forget dirty-tile claims owned by one robot."""
+        self.tile_claims = {
+            tile_key: owner
+            for tile_key, owner in self.tile_claims.items()
+            if owner != robot_name
+        }
+
+    def release_room_claims(self, room):
+        """Forget all dirty-tile claims in one room."""
+        self.tile_claims = {
+            tile_key: owner
+            for tile_key, owner in self.tile_claims.items()
+            if tile_key[0] != room
+        }
+
+    def prune_cleaned_claims(self):
+        """Drop claims for tiles that are no longer dirty."""
+        self.tile_claims = {
+            tile_key: owner
+            for tile_key, owner in self.tile_claims.items()
+            if tile_key in self.dirty_tiles
+        }
+
+    def claim_dirty_tile_centers(
+        self,
+        room,
+        robot_name,
+        robot_pose=None,
+        max_tiles=CLEANUP_TARGETS_PER_ROBOT,
+    ):
+        """
+        Reserve a small cleanup batch for one robot.
+
+        A claim is like putting a robot's name on a dirty square, so another
+        robot does not drive to the same square unless the claim is released.
+        """
+        if room not in self.rooms or max_tiles <= 0:
+            return []
+
+        self.prune_cleaned_claims()
+        claimed_by_robot = [
+            tile_key
+            for tile_key, owner in self.tile_claims.items()
+            if owner == robot_name
+            and tile_key in self.dirty_tiles
+            and tile_key[0] == room
+        ]
+
+        open_tiles = [
+            tile_key
+            for tile_key in self.dirty_tiles
+            if tile_key[0] == room
+            and self.tile_claims.get(tile_key, robot_name) == robot_name
+            and tile_key not in claimed_by_robot
+        ]
+
+        def sort_key(tile_key):
+            center_x_m, center_y_m = self.tile_center(tile_key)
+            if robot_pose is None:
+                distance_m = 0.0
+            else:
+                distance_m = math.hypot(
+                    center_x_m - robot_pose["x_m"],
+                    center_y_m - robot_pose["y_m"],
+                )
+            _, col_index, row_index = tile_key
+            return (distance_m, row_index, col_index)
+
+        selected_tiles = sorted(claimed_by_robot, key=sort_key)
+        selected_tiles.extend(
+            sorted(open_tiles, key=sort_key)[:max(0, max_tiles - len(selected_tiles))]
+        )
+        selected_tiles = selected_tiles[:max_tiles]
+
+        for tile_key in selected_tiles:
+            self.tile_claims[tile_key] = robot_name
+
+        return [self.tile_center(tile_key) for tile_key in selected_tiles]
 
 
 def room_reached_coverage_goal(cleaning_overlay, room):
@@ -922,7 +1027,14 @@ def run():
                     coverage_done_for_room
                     and not room_reached_coverage_goal(cleaning_overlay, room)
                 ):
-                    cleanup_plan = cleaning_overlay.dirty_tile_centers(room)
+                    pose = get_actual_robot_pose(supervisor, robot_name)
+                    if pose is None:
+                        pose = status["pose"]
+                    cleanup_plan = cleaning_overlay.claim_dirty_tile_centers(
+                        room,
+                        robot_name,
+                        pose,
+                    )
                     cleanup_signature = (
                         room,
                         tuple(tuple(waypoint) for waypoint in cleanup_plan),
@@ -941,7 +1053,7 @@ def run():
                         cleanup_plan_signatures[robot_name] = cleanup_signature
                         print(
                             f"[supervisor] Sent {robot_name} cleanup pass for "
-                            f"{room}: {len(cleanup_plan)} dirty tile(s) remain"
+                            f"{room}: {len(cleanup_plan)} claimed dirty tile(s)"
                         )
                     continue
 
@@ -949,8 +1061,10 @@ def run():
                     continue
 
                 cleanup_plan_signatures.pop(robot_name, None)
+                cleaning_overlay.release_robot_claims(robot_name)
                 if room not in completed_rooms:
                     completed_rooms.add(room)
+                    cleaning_overlay.release_room_claims(room)
                     print(
                         f"[supervisor] Room {room} reached "
                         f"{cleaning_overlay.room_progress_percent(room):.1f}% clean"
@@ -971,6 +1085,7 @@ def run():
                     room_assignments[robot_name] = None
                     coverage_plans[robot_name] = []
                     cleanup_plan_signatures.pop(robot_name, None)
+                    cleaning_overlay.release_robot_claims(robot_name)
                     last_cleaning_poses.pop(robot_name, None)
                     print(f"[supervisor] {robot_name} has no unfinished room to help")
                     continue
@@ -984,6 +1099,7 @@ def run():
                     next_assignment,
                 )
                 cleanup_plan_signatures.pop(robot_name, None)
+                cleaning_overlay.release_robot_claims(robot_name)
                 last_cleaning_poses.pop(robot_name, None)
                 print(
                     f"[supervisor] Reassigned {robot_name} to help {next_room}; "

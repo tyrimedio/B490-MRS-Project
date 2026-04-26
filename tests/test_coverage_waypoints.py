@@ -45,6 +45,30 @@ class CoverageWaypointTests(unittest.TestCase):
                 self.assertIn(sweep_max_y, row_positions)
                 self.assertEqual(sweep_max_y, row_positions[-1])
 
+    def test_coverage_waypoints_keep_robot_center_away_from_walls(self):
+        supervisor = load_supervisor_module()
+
+        for room, config in supervisor.ROOM_TASKS.items():
+            with self.subTest(room=room):
+                min_x, max_x, min_y, max_y = config["bounds"]
+                for x_m, y_m in supervisor.generate_coverage_waypoints(room):
+                    self.assertGreaterEqual(
+                        x_m - min_x + 1e-9,
+                        supervisor.COVERAGE_MARGIN_M,
+                    )
+                    self.assertGreaterEqual(
+                        max_x - x_m + 1e-9,
+                        supervisor.COVERAGE_MARGIN_M,
+                    )
+                    self.assertGreaterEqual(
+                        y_m - min_y + 1e-9,
+                        supervisor.COVERAGE_MARGIN_M,
+                    )
+                    self.assertGreaterEqual(
+                        max_y - y_m + 1e-9,
+                        supervisor.COVERAGE_MARGIN_M,
+                    )
+
     def test_coverage_reach_distance_cleans_endpoint_tiles(self):
         controller = load_controller_module()
         supervisor = load_supervisor_module()
@@ -239,6 +263,122 @@ class CoverageWaypointTests(unittest.TestCase):
         centers = overlay.dirty_tile_centers("nw_small")
 
         self.assertEqual([[-2.875, 0.875], [-2.625, 0.875]], centers)
+
+    def test_dirty_tile_centers_align_to_floor_checkerboard(self):
+        supervisor = load_supervisor_module()
+        overlay = supervisor.CleaningOverlay.__new__(supervisor.CleaningOverlay)
+        overlay.rooms = supervisor.ROOM_TASKS
+        overlay.dirty_tiles = {
+            ("ne_large", 0, 0),
+            ("s_medium", 0, 0),
+        }
+
+        self.assertEqual([[0.875, 0.875]], overlay.dirty_tile_centers("ne_large"))
+        self.assertEqual([[-0.625, -2.875]], overlay.dirty_tile_centers("s_medium"))
+
+    def test_cleanup_claims_give_robots_different_dirty_tiles(self):
+        supervisor = load_supervisor_module()
+        overlay = supervisor.CleaningOverlay.__new__(supervisor.CleaningOverlay)
+        overlay.rooms = supervisor.ROOM_TASKS
+        overlay.tile_claims = {}
+        overlay.dirty_tiles = {
+            ("nw_small", 0, 0),
+            ("nw_small", 1, 0),
+            ("nw_small", 2, 0),
+            ("nw_small", 3, 0),
+        }
+
+        first_plan = overlay.claim_dirty_tile_centers(
+            "nw_small",
+            "epuck_1",
+            {"x_m": -2.9, "y_m": 0.9},
+            max_tiles=2,
+        )
+        second_plan = overlay.claim_dirty_tile_centers(
+            "nw_small",
+            "epuck_2",
+            {"x_m": -2.1, "y_m": 0.9},
+            max_tiles=2,
+        )
+
+        self.assertEqual(2, len(first_plan))
+        self.assertEqual(2, len(second_plan))
+        self.assertEqual(
+            set(),
+            set(map(tuple, first_plan)) & set(map(tuple, second_plan)),
+        )
+        self.assertEqual(
+            {
+                ("nw_small", 0, 0): "epuck_1",
+                ("nw_small", 1, 0): "epuck_1",
+                ("nw_small", 2, 0): "epuck_2",
+                ("nw_small", 3, 0): "epuck_2",
+            },
+            overlay.tile_claims,
+        )
+
+    def test_cleanup_claims_prefer_nearby_dirty_tiles(self):
+        supervisor = load_supervisor_module()
+        overlay = supervisor.CleaningOverlay.__new__(supervisor.CleaningOverlay)
+        overlay.rooms = supervisor.ROOM_TASKS
+        overlay.tile_claims = {}
+        overlay.dirty_tiles = {
+            ("nw_small", 0, 0),
+            ("nw_small", 1, 0),
+            ("nw_small", 2, 0),
+        }
+
+        plan = overlay.claim_dirty_tile_centers(
+            "nw_small",
+            "epuck_1",
+            {"x_m": -2.62, "y_m": 0.88},
+            max_tiles=1,
+        )
+
+        self.assertEqual([[-2.625, 0.875]], plan)
+        self.assertEqual({("nw_small", 1, 0): "epuck_1"}, overlay.tile_claims)
+
+    def test_cleaning_a_tile_releases_its_claim(self):
+        supervisor = load_supervisor_module()
+
+        class FakeField:
+            def setSFColor(self, value):
+                self.value = value
+
+            def setSFFloat(self, value):
+                self.value = value
+
+        class FakeAppearance:
+            def getField(self, field_name):
+                return FakeField()
+
+        tile_key = ("nw_small", 0, 0)
+        overlay = supervisor.CleaningOverlay.__new__(supervisor.CleaningOverlay)
+        overlay.enabled = True
+        overlay.active_rooms = {"nw_small"}
+        overlay.rooms = supervisor.ROOM_TASKS
+        overlay.dirty_tiles = {tile_key}
+        overlay.tile_claims = {tile_key: "epuck_1"}
+        overlay.tile_appearances = {tile_key: FakeAppearance()}
+
+        cleaned_count = overlay.mark_clean_near("nw_small", -2.875, 0.875)
+
+        self.assertEqual(1, cleaned_count)
+        self.assertEqual(set(), overlay.dirty_tiles)
+        self.assertEqual({}, overlay.tile_claims)
+
+    def test_releasing_robot_claims_keeps_other_robot_claims(self):
+        supervisor = load_supervisor_module()
+        overlay = supervisor.CleaningOverlay.__new__(supervisor.CleaningOverlay)
+        overlay.tile_claims = {
+            ("nw_small", 0, 0): "epuck_1",
+            ("nw_small", 1, 0): "epuck_2",
+            ("n_medium", 0, 0): "epuck_1",
+        }
+
+        overlay.release_robot_claims("epuck_1")
+
+        self.assertEqual({("nw_small", 1, 0): "epuck_2"}, overlay.tile_claims)
 
     def test_room_progress_snapshot_reports_every_room(self):
         supervisor = load_supervisor_module()
