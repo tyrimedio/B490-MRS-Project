@@ -863,6 +863,43 @@ class CoverageWaypointTests(unittest.TestCase):
             monitors["n_medium"]["step"],
         )
 
+    def test_room_progress_monitor_tracks_recent_cleaning_rate(self):
+        supervisor = load_supervisor_module()
+        monitors = {}
+        room_assignments = {"epuck_1": {"room": "n_medium"}}
+        progress = {room: 100.0 for room in supervisor.ROOM_TASKS}
+        progress["n_medium"] = 40.0
+
+        supervisor.update_room_progress_monitors(
+            monitors,
+            progress,
+            room_assignments,
+            set(),
+            0,
+        )
+
+        progress["n_medium"] = 41.0
+        supervisor.update_room_progress_monitors(
+            monitors,
+            progress,
+            room_assignments,
+            set(),
+            100,
+        )
+        self.assertAlmostEqual(
+            10.0,
+            supervisor.room_progress_rate(monitors, "n_medium"),
+        )
+
+        supervisor.update_room_progress_monitors(
+            monitors,
+            progress,
+            room_assignments,
+            set(),
+            100 + supervisor.ROOM_PROGRESS_RATE_WINDOW_STEPS,
+        )
+        self.assertEqual(0.0, supervisor.room_progress_rate(monitors, "n_medium"))
+
     def test_stalled_room_redirect_prefers_idle_robot(self):
         supervisor = load_supervisor_module()
         overlay = supervisor.CleaningOverlay.__new__(supervisor.CleaningOverlay)
@@ -882,6 +919,31 @@ class CoverageWaypointTests(unittest.TestCase):
         )
 
         self.assertEqual("epuck_2", robot)
+
+    def test_stalled_room_redirect_prefers_closest_idle_robot(self):
+        supervisor = load_supervisor_module()
+        overlay = supervisor.CleaningOverlay.__new__(supervisor.CleaningOverlay)
+        overlay.room_tile_counts = {room: 10 for room in supervisor.ROOM_TASKS}
+        overlay.dirty_tiles = {("n_medium", 0, 0)}
+        room_assignments = {
+            "epuck_1": {"room": "n_medium"},
+            "epuck_2": None,
+            "epuck_3": None,
+            "epuck_4": {"room": "se_small"},
+        }
+        latest_robot_status = {
+            "epuck_2": {"pose": {"x_m": 2.6, "y_m": -2.6}},
+            "epuck_3": {"pose": {"x_m": -0.2, "y_m": 0.2}},
+        }
+
+        robot = supervisor.select_robot_for_stalled_room(
+            "n_medium",
+            room_assignments,
+            overlay,
+            latest_robot_status=latest_robot_status,
+        )
+
+        self.assertEqual("epuck_3", robot)
 
     def test_stalled_room_redirect_can_reuse_helper_from_supported_room(self):
         supervisor = load_supervisor_module()
@@ -1024,6 +1086,36 @@ class CoverageWaypointTests(unittest.TestCase):
 
         self.assertEqual("n_medium", next_room)
 
+    def test_reassignment_keeps_unstaffed_rooms_ahead_of_nearby_supported_rooms(self):
+        supervisor = load_supervisor_module()
+        overlay = supervisor.CleaningOverlay.__new__(supervisor.CleaningOverlay)
+        overlay.room_tile_counts = {room: 100 for room in supervisor.ROOM_TASKS}
+        overlay.dirty_tiles = {
+            ("s_medium", col_index, 0)
+            for col_index in range(70)
+        } | {
+            ("ne_large", col_index, 0)
+            for col_index in range(20)
+        }
+        room_assignments = {
+            "epuck_1": {"room": "nw_small"},
+            "epuck_2": {"room": "s_medium"},
+            "epuck_3": {"room": "se_small"},
+        }
+        latest_robot_status = {
+            "epuck_1": {"pose": {"x_m": 0.3, "y_m": -0.7}},
+        }
+
+        next_room = supervisor.select_reassignment_room(
+            "epuck_1",
+            room_assignments,
+            {"nw_small", "n_medium", "sw_large", "se_small"},
+            overlay,
+            latest_robot_status=latest_robot_status,
+        )
+
+        self.assertEqual("ne_large", next_room)
+
     def test_reassignment_balances_helpers_before_progress(self):
         supervisor = load_supervisor_module()
         overlay = supervisor.CleaningOverlay.__new__(supervisor.CleaningOverlay)
@@ -1077,6 +1169,67 @@ class CoverageWaypointTests(unittest.TestCase):
         )
 
         self.assertEqual("ne_large", next_room)
+
+    def test_reassignment_prefers_slow_progress_room_when_support_matches(self):
+        supervisor = load_supervisor_module()
+        overlay = supervisor.CleaningOverlay.__new__(supervisor.CleaningOverlay)
+        overlay.room_tile_counts = {room: 100 for room in supervisor.ROOM_TASKS}
+        overlay.dirty_tiles = {
+            ("ne_large", col_index, 0)
+            for col_index in range(40)
+        } | {
+            ("sw_large", col_index, 0)
+            for col_index in range(40)
+        }
+        room_assignments = {
+            "epuck_1": {"room": "nw_small"},
+            "epuck_2": {"room": "ne_large"},
+            "epuck_3": {"room": "sw_large"},
+        }
+        progress_monitors = {
+            "ne_large": {"rate_percent_per_1000_steps": 8.0},
+            "sw_large": {"rate_percent_per_1000_steps": 0.0},
+        }
+
+        next_room = supervisor.select_reassignment_room(
+            "epuck_1",
+            room_assignments,
+            {"nw_small", "n_medium", "s_medium", "se_small"},
+            overlay,
+            progress_monitors=progress_monitors,
+        )
+
+        self.assertEqual("sw_large", next_room)
+
+    def test_reassignment_uses_route_cost_when_need_is_similar(self):
+        supervisor = load_supervisor_module()
+        overlay = supervisor.CleaningOverlay.__new__(supervisor.CleaningOverlay)
+        overlay.room_tile_counts = {room: 100 for room in supervisor.ROOM_TASKS}
+        overlay.dirty_tiles = {
+            ("n_medium", col_index, 0)
+            for col_index in range(40)
+        } | {
+            ("s_medium", col_index, 0)
+            for col_index in range(40)
+        }
+        room_assignments = {
+            "epuck_1": {"room": "nw_small"},
+            "epuck_2": {"room": "n_medium"},
+            "epuck_3": {"room": "s_medium"},
+        }
+        latest_robot_status = {
+            "epuck_1": {"pose": {"x_m": 0.2, "y_m": -0.2}},
+        }
+
+        next_room = supervisor.select_reassignment_room(
+            "epuck_1",
+            room_assignments,
+            {"nw_small", "ne_large", "sw_large", "se_small"},
+            overlay,
+            latest_robot_status=latest_robot_status,
+        )
+
+        self.assertEqual("s_medium", next_room)
 
     def test_reassignment_can_join_room_that_already_has_helper(self):
         supervisor = load_supervisor_module()
@@ -1149,6 +1302,31 @@ class CoverageWaypointTests(unittest.TestCase):
         )
 
         self.assertEqual("nw_small", recovery_room)
+
+    def test_repeated_stuck_robot_can_switch_from_supported_room(self):
+        supervisor = load_supervisor_module()
+        overlay = supervisor.CleaningOverlay.__new__(supervisor.CleaningOverlay)
+        overlay.room_tile_counts = {room: 20 for room in supervisor.ROOM_TASKS}
+        overlay.dirty_tiles = {
+            ("ne_large", 0, 0),
+            ("n_medium", 0, 0),
+        }
+        room_assignments = {
+            "epuck_1": {"room": "ne_large"},
+            "epuck_2": {"room": "ne_large"},
+            "epuck_3": {"room": "s_medium"},
+            "epuck_4": {"room": "se_small"},
+        }
+
+        recovery_room = supervisor.select_stuck_recovery_room(
+            "epuck_1",
+            room_assignments,
+            {"nw_small", "s_medium", "se_small"},
+            overlay,
+            recovery_count=supervisor.STUCK_ROUTE_RETRY_LIMIT + 1,
+        )
+
+        self.assertEqual("n_medium", recovery_room)
 
     def test_stuck_recovery_can_reassign_after_current_room_is_complete(self):
         supervisor = load_supervisor_module()

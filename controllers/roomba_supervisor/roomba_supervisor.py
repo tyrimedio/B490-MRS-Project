@@ -52,6 +52,11 @@ ROBOT_RECOVERY_TURN_STEPS = 24
 ROOM_PROGRESS_STALL_STEPS = 600
 ROOM_PROGRESS_MIN_DELTA_PERCENT = 0.1
 ROOM_PROGRESS_ALERT_COOLDOWN_STEPS = 600
+ROOM_PROGRESS_RATE_WINDOW_STEPS = 300
+MRTA_PROGRESS_RATE_WEIGHT = 0.35
+MRTA_ROUTE_DISTANCE_WEIGHT = 0.18
+MRTA_DIRTY_PERCENT_WEIGHT = 0.01
+STUCK_ROUTE_RETRY_LIMIT = 1
 SMALL_ROOM_MAX_PRIMARY_ROBOTS = 1
 LARGE_ROOM_MAX_PRIMARY_ROBOTS = 2
 TRAFFIC_RESOURCE_STAGGER_STEPS = 24
@@ -1427,6 +1432,48 @@ def format_room_progress(snapshot):
     )
 
 
+def room_dirty_tile_count(cleaning_overlay, room):
+    """Return how many visible dirty tiles remain in one room."""
+    return sum(
+        1 for tile_room, _, _ in getattr(cleaning_overlay, "dirty_tiles", set())
+        if tile_room == room
+    )
+
+
+def room_dirty_percent(cleaning_overlay, room):
+    """Return roughly how much of one room still needs work."""
+    total_tiles = cleaning_overlay.room_tile_counts.get(room, 0)
+    if total_tiles <= 0:
+        return 0.0
+    return 100.0 * room_dirty_tile_count(cleaning_overlay, room) / total_tiles
+
+
+def room_progress_rate(progress_monitors, room):
+    """
+    Return recent cleaning progress in percent per 1000 supervisor steps.
+
+    Bigger means a room is still improving on its own. Near zero means help is
+    more useful there, like noticing one chore has stopped moving while others
+    are still getting done.
+    """
+    monitor = progress_monitors.get(room, {})
+    rate = monitor.get("rate_percent_per_1000_steps")
+    if isinstance(rate, (int, float)):
+        return rate
+    return 0.0
+
+
+def route_cost_to_room(robot_status, room):
+    """Return planned route distance from one robot status to a room."""
+    if not isinstance(robot_status, dict):
+        return float("inf")
+    pose = robot_status.get("pose")
+    if pose is None:
+        return float("inf")
+    route = generate_assignment_route(pose, room)
+    return route_distance_m(pose, route)
+
+
 def pose_distance_m(first_pose, second_pose):
     """Return ground distance between two robot poses."""
     if first_pose is None or second_pose is None:
@@ -1547,6 +1594,7 @@ def update_room_progress_monitors(
             monitor["progress"] = progress_percent
             monitor["step"] = step_count
             monitor["ready"] = False
+            monitor["rate_percent_per_1000_steps"] = 0.0
             continue
 
         previous_progress = monitor.get("progress")
@@ -1559,15 +1607,23 @@ def update_room_progress_monitors(
             monitor["progress"] = progress_percent
             monitor["step"] = step_count
             monitor["ready"] = True
+            monitor["rate_percent_per_1000_steps"] = 0.0
             continue
 
         if progress_percent >= previous_progress + ROOM_PROGRESS_MIN_DELTA_PERCENT:
+            elapsed_steps = max(1, step_count - previous_step)
+            progress_gain = progress_percent - previous_progress
+            monitor["rate_percent_per_1000_steps"] = (
+                progress_gain / elapsed_steps * 1000.0
+            )
             monitor["progress"] = progress_percent
             monitor["step"] = step_count
             monitor["ready"] = True
             continue
 
         elapsed_steps = step_count - previous_step
+        if elapsed_steps >= ROOM_PROGRESS_RATE_WINDOW_STEPS:
+            monitor["rate_percent_per_1000_steps"] = 0.0
         if elapsed_steps < ROOM_PROGRESS_STALL_STEPS:
             continue
 
@@ -1614,16 +1670,26 @@ def select_robot_for_stalled_room(
     room_assignments,
     cleaning_overlay,
     excluded_robots=None,
+    latest_robot_status=None,
 ):
     """Pick a robot that can be redirected to a stalled room without abandoning work."""
     if excluded_robots is None:
         excluded_robots = set()
+    if latest_robot_status is None:
+        latest_robot_status = {}
 
+    idle_candidates = []
     for robot_name in EXPECTED_ROBOTS:
         if robot_name in excluded_robots:
             continue
         if room_assignments.get(robot_name) is None:
-            return robot_name
+            idle_candidates.append((
+                route_cost_to_room(latest_robot_status.get(robot_name), stalled_room),
+                robot_name,
+            ))
+    if idle_candidates:
+        idle_candidates.sort()
+        return idle_candidates[0][1]
 
     active_room_counts = {}
     for assignment in room_assignments.values():
@@ -1647,7 +1713,11 @@ def select_robot_for_stalled_room(
         if source_count <= source_target_count:
             continue
 
-        candidate = (-source_progress, robot_name)
+        route_distance_m = route_cost_to_room(
+            latest_robot_status.get(robot_name),
+            stalled_room,
+        )
+        candidate = (route_distance_m, -source_progress, robot_name)
         if assignment.get("helper", False):
             helper_candidates.append(candidate)
         else:
@@ -1658,7 +1728,7 @@ def select_robot_for_stalled_room(
         return None
 
     candidates.sort()
-    return candidates[0][1]
+    return candidates[0][-1]
 
 
 def target_robot_count_for_room(room):
@@ -1672,6 +1742,14 @@ def target_robot_count_for_room(room):
     if area_m2 <= ROOM_TASKS["nw_small"]["area_m2"] + 1e-9:
         return SMALL_ROOM_MAX_PRIMARY_ROBOTS
     return LARGE_ROOM_MAX_PRIMARY_ROBOTS
+
+
+def active_robot_count(room_assignments, room):
+    """Return how many robots are currently assigned to one room."""
+    return sum(
+        1 for assignment in room_assignments.values()
+        if assignment is not None and assignment["room"] == room
+    )
 
 
 def unfinished_rooms_below_target(
@@ -1718,6 +1796,8 @@ def select_reassignment_room(
     room_assignments,
     completed_rooms,
     cleaning_overlay,
+    latest_robot_status=None,
+    progress_monitors=None,
 ):
     """
     Pick the unfinished room that most needs help.
@@ -1730,6 +1810,10 @@ def select_reassignment_room(
     current_room = None
     if current_assignment is not None:
         current_room = current_assignment["room"]
+    if latest_robot_status is None:
+        latest_robot_status = {}
+    if progress_monitors is None:
+        progress_monitors = {}
 
     active_room_counts = {}
     for robot, assignment in room_assignments.items():
@@ -1756,9 +1840,22 @@ def select_reassignment_room(
             continue
         target_count = target_robot_count_for_room(room)
         active_count = active_room_counts.get(room, 0)
+        support_ratio = active_count / target_count
+        progress_rate = room_progress_rate(progress_monitors, room)
+        route_distance = route_cost_to_room(latest_robot_status.get(robot_name), room)
+        dirty_percent = room_dirty_percent(cleaning_overlay, room)
+        score = (
+            support_ratio
+            + MRTA_PROGRESS_RATE_WEIGHT * progress_rate
+            + MRTA_ROUTE_DISTANCE_WEIGHT * route_distance
+            - MRTA_DIRTY_PERCENT_WEIGHT * dirty_percent
+        )
         candidate_rooms.append((
-            active_count / target_count,
+            support_ratio,
+            score,
+            progress_rate,
             progress_percent,
+            route_distance,
             room,
         ))
 
@@ -1766,7 +1863,7 @@ def select_reassignment_room(
         return None
 
     candidate_rooms.sort()
-    return candidate_rooms[0][2]
+    return candidate_rooms[0][5]
 
 
 def select_stuck_recovery_room(
@@ -1774,25 +1871,42 @@ def select_stuck_recovery_room(
     room_assignments,
     completed_rooms,
     cleaning_overlay,
+    latest_robot_status=None,
+    progress_monitors=None,
+    recovery_count=0,
 ):
-    """Keep a stuck robot focused on its room unless that room is already done."""
+    """Choose whether a stuck robot should retry its room or help elsewhere."""
     assignment = room_assignments.get(robot_name)
     if assignment is None:
         return None
 
     room = assignment["room"]
-    if (
+    room_unfinished = (
         room not in completed_rooms
         and not room_reached_coverage_goal(cleaning_overlay, room)
+    )
+    if (
+        room_unfinished
+        and (
+            recovery_count <= STUCK_ROUTE_RETRY_LIMIT
+            or active_robot_count(room_assignments, room) <= 1
+        )
     ):
         return room
 
-    return select_reassignment_room(
+    fallback_room = select_reassignment_room(
         robot_name,
         room_assignments,
         completed_rooms,
         cleaning_overlay,
+        latest_robot_status,
+        progress_monitors,
     )
+    if fallback_room is not None:
+        return fallback_room
+    if room_unfinished:
+        return room
+    return None
 
 
 def build_assignment(robot_status, room, helper=False):
@@ -2093,6 +2207,7 @@ def run():
     cleanup_plan_signatures = {}
     cleanup_plan_steps = {}
     robot_motion_monitors = {}
+    robot_recovery_counts = {}
     room_progress_monitors = {}
     last_scan_match_log_steps = {}
     last_map_update_log_steps = {}
@@ -2179,6 +2294,7 @@ def run():
                     pose,
                 )
                 if cleaned_count:
+                    robot_recovery_counts.pop(robot_name, None)
                     room_progress = cleaning_overlay.room_progress_percent(
                         assignment["room"]
                     )
@@ -2261,11 +2377,16 @@ def run():
                     continue
 
                 room = assignment["room"]
+                recovery_count = robot_recovery_counts.get(robot_name, 0) + 1
+                robot_recovery_counts[robot_name] = recovery_count
                 next_room = select_stuck_recovery_room(
                     robot_name,
                     room_assignments,
                     completed_rooms,
                     cleaning_overlay,
+                    latest_robot_status,
+                    room_progress_monitors,
+                    recovery_count,
                 )
                 if next_room is None:
                     continue
@@ -2301,6 +2422,7 @@ def run():
                     )
                 )
                 if room != next_room:
+                    robot_recovery_counts.pop(robot_name, None)
                     coverage_plans.update(
                         send_room_coverage_plans(
                             emitter,
@@ -2315,7 +2437,8 @@ def run():
                 print(
                     f"[supervisor] {robot_name} appears stuck "
                     f"({stuck_reason}); sent recovery nudge and "
-                    f"retrying {next_room}"
+                    f"routing to {next_room} "
+                    f"(recovery_attempt={recovery_count})"
                 )
 
             progress_snapshot = room_progress_snapshot(cleaning_overlay)
@@ -2346,6 +2469,7 @@ def run():
                     room_assignments,
                     cleaning_overlay,
                     excluded_robots=redirected_robots,
+                    latest_robot_status=latest_robot_status,
                 )
                 if robot_to_redirect is None:
                     print(
@@ -2368,6 +2492,7 @@ def run():
                 cleanup_plan_steps.pop(robot_to_redirect, None)
                 last_cleaning_poses.pop(robot_to_redirect, None)
                 completed_robot_rooms.pop(robot_to_redirect, None)
+                robot_recovery_counts.pop(robot_to_redirect, None)
                 next_assignment = build_assignment(
                     status,
                     redirect_room,
@@ -2475,6 +2600,8 @@ def run():
                     room_assignments,
                     completed_rooms,
                     cleaning_overlay,
+                    latest_robot_status,
+                    room_progress_monitors,
                 )
                 if next_room is None:
                     send_idle_command(emitter, robot_name)
@@ -2484,6 +2611,7 @@ def run():
                     cleanup_plan_steps.pop(robot_name, None)
                     cleaning_overlay.release_robot_claims(robot_name)
                     last_cleaning_poses.pop(robot_name, None)
+                    robot_recovery_counts.pop(robot_name, None)
                     print(
                         f"[supervisor] {robot_name} has no unfinished room to help; "
                         "all visible dirty tiles are clean, holding idle"
@@ -2491,6 +2619,7 @@ def run():
                     continue
 
                 next_assignment = build_assignment(status, next_room, helper=True)
+                robot_recovery_counts.pop(robot_name, None)
                 room_assignments[robot_name] = next_assignment
                 cleaning_overlay.show_dirty_room(next_room)
                 send_assignment_commands(
