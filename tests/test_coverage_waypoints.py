@@ -404,6 +404,279 @@ class CoverageWaypointTests(unittest.TestCase):
         self.assertIn("ne_large=70.0%", formatted)
         self.assertIn("nw_small=100.0%", formatted)
 
+    def test_robot_motion_monitor_flags_robot_that_should_move_but_does_not(self):
+        supervisor = load_supervisor_module()
+        monitors = {}
+        assignment = {"room": "n_medium"}
+        status = {
+            "launch": {"complete": True, "timed_out": False},
+            "assignment_target_reached": False,
+            "coverage": {"room": "n_medium", "complete": False},
+            "motion": {"front_blocked": True},
+        }
+        pose = {"x_m": 0.0, "y_m": 0.0}
+
+        stuck, _ = supervisor.update_robot_motion_monitor(
+            monitors,
+            "epuck_1",
+            status,
+            pose,
+            assignment,
+            0,
+        )
+        self.assertFalse(stuck)
+
+        stuck, reason = supervisor.update_robot_motion_monitor(
+            monitors,
+            "epuck_1",
+            status,
+            pose,
+            assignment,
+            supervisor.ROBOT_STUCK_WINDOW_STEPS,
+        )
+
+        self.assertTrue(stuck)
+        self.assertEqual("blocked by nearby obstacle", reason)
+
+    def test_robot_motion_monitor_resets_when_robot_moves_enough(self):
+        supervisor = load_supervisor_module()
+        monitors = {}
+        assignment = {"room": "n_medium"}
+        status = {
+            "launch": {"complete": True, "timed_out": False},
+            "assignment_target_reached": True,
+            "coverage": {"room": "n_medium", "complete": False},
+            "motion": {},
+        }
+
+        supervisor.update_robot_motion_monitor(
+            monitors,
+            "epuck_1",
+            status,
+            {"x_m": 0.0, "y_m": 0.0},
+            assignment,
+            0,
+        )
+        stuck, _ = supervisor.update_robot_motion_monitor(
+            monitors,
+            "epuck_1",
+            status,
+            {"x_m": supervisor.ROBOT_STUCK_MIN_MOVE_M, "y_m": 0.0},
+            assignment,
+            supervisor.ROBOT_STUCK_WINDOW_STEPS,
+        )
+
+        self.assertFalse(stuck)
+        self.assertEqual(
+            supervisor.ROBOT_STUCK_WINDOW_STEPS,
+            monitors["epuck_1"]["anchor_step"],
+        )
+
+    def test_room_progress_monitor_flags_active_room_without_cleaning_gain(self):
+        supervisor = load_supervisor_module()
+        monitors = {}
+        room_assignments = {"epuck_1": {"room": "n_medium"}}
+        progress = {room: 100.0 for room in supervisor.ROOM_TASKS}
+        progress["n_medium"] = 40.0
+
+        stalled_rooms = supervisor.update_room_progress_monitors(
+            monitors,
+            progress,
+            room_assignments,
+            set(),
+            0,
+        )
+        self.assertEqual([], stalled_rooms)
+
+        stalled_rooms = supervisor.update_room_progress_monitors(
+            monitors,
+            progress,
+            room_assignments,
+            set(),
+            supervisor.ROOM_PROGRESS_STALL_STEPS,
+        )
+
+        self.assertEqual(["n_medium"], stalled_rooms)
+
+    def test_room_progress_monitor_waits_until_robot_can_clean_room(self):
+        supervisor = load_supervisor_module()
+        monitors = {}
+        room_assignments = {"epuck_1": {"room": "n_medium"}}
+        progress = {room: 100.0 for room in supervisor.ROOM_TASKS}
+        progress["n_medium"] = 40.0
+
+        supervisor.update_room_progress_monitors(
+            monitors,
+            progress,
+            room_assignments,
+            set(),
+            0,
+            progress_ready_rooms=set(),
+        )
+        stalled_rooms = supervisor.update_room_progress_monitors(
+            monitors,
+            progress,
+            room_assignments,
+            set(),
+            supervisor.ROOM_PROGRESS_STALL_STEPS,
+            progress_ready_rooms=set(),
+        )
+
+        self.assertEqual([], stalled_rooms)
+
+        stalled_rooms = supervisor.update_room_progress_monitors(
+            monitors,
+            progress,
+            room_assignments,
+            set(),
+            2 * supervisor.ROOM_PROGRESS_STALL_STEPS,
+            progress_ready_rooms={"n_medium"},
+        )
+        self.assertEqual([], stalled_rooms)
+
+        stalled_rooms = supervisor.update_room_progress_monitors(
+            monitors,
+            progress,
+            room_assignments,
+            set(),
+            3 * supervisor.ROOM_PROGRESS_STALL_STEPS,
+            progress_ready_rooms={"n_medium"},
+        )
+        self.assertEqual(["n_medium"], stalled_rooms)
+
+    def test_room_progress_monitor_resets_after_cleaning_gain(self):
+        supervisor = load_supervisor_module()
+        monitors = {}
+        room_assignments = {"epuck_1": {"room": "n_medium"}}
+        progress = {room: 100.0 for room in supervisor.ROOM_TASKS}
+        progress["n_medium"] = 40.0
+        supervisor.update_room_progress_monitors(
+            monitors,
+            progress,
+            room_assignments,
+            set(),
+            0,
+        )
+
+        progress["n_medium"] = 40.2
+        stalled_rooms = supervisor.update_room_progress_monitors(
+            monitors,
+            progress,
+            room_assignments,
+            set(),
+            supervisor.ROOM_PROGRESS_STALL_STEPS,
+        )
+
+        self.assertEqual([], stalled_rooms)
+        self.assertEqual(
+            supervisor.ROOM_PROGRESS_STALL_STEPS,
+            monitors["n_medium"]["step"],
+        )
+
+    def test_stalled_room_redirect_prefers_idle_robot(self):
+        supervisor = load_supervisor_module()
+        overlay = supervisor.CleaningOverlay.__new__(supervisor.CleaningOverlay)
+        overlay.room_tile_counts = {room: 10 for room in supervisor.ROOM_TASKS}
+        overlay.dirty_tiles = {("n_medium", 0, 0)}
+        room_assignments = {
+            "epuck_1": {"room": "n_medium"},
+            "epuck_2": None,
+            "epuck_3": {"room": "ne_large"},
+            "epuck_4": {"room": "se_small"},
+        }
+
+        robot = supervisor.select_robot_for_stalled_room(
+            "n_medium",
+            room_assignments,
+            overlay,
+        )
+
+        self.assertEqual("epuck_2", robot)
+
+    def test_stalled_room_redirect_can_reuse_helper_from_supported_room(self):
+        supervisor = load_supervisor_module()
+        overlay = supervisor.CleaningOverlay.__new__(supervisor.CleaningOverlay)
+        overlay.room_tile_counts = {room: 10 for room in supervisor.ROOM_TASKS}
+        overlay.dirty_tiles = {
+            ("n_medium", 0, 0),
+            ("ne_large", 0, 0),
+            ("ne_large", 1, 0),
+        }
+        room_assignments = {
+            "epuck_1": {"room": "n_medium"},
+            "epuck_2": {"room": "ne_large", "helper": True},
+            "epuck_3": {"room": "ne_large"},
+            "epuck_4": {"room": "se_small"},
+        }
+
+        robot = supervisor.select_robot_for_stalled_room(
+            "n_medium",
+            room_assignments,
+            overlay,
+        )
+
+        self.assertEqual("epuck_2", robot)
+
+    def test_stalled_room_redirect_skips_robot_already_redirected_this_pass(self):
+        supervisor = load_supervisor_module()
+        overlay = supervisor.CleaningOverlay.__new__(supervisor.CleaningOverlay)
+        overlay.room_tile_counts = {room: 10 for room in supervisor.ROOM_TASKS}
+        overlay.dirty_tiles = {
+            ("n_medium", 0, 0),
+            ("ne_large", 0, 0),
+            ("sw_large", 0, 0),
+        }
+        room_assignments = {
+            "epuck_1": {"room": "n_medium"},
+            "epuck_2": {"room": "ne_large", "helper": True},
+            "epuck_3": {"room": "ne_large"},
+            "epuck_4": {"room": "se_small"},
+        }
+
+        first_robot = supervisor.select_robot_for_stalled_room(
+            "n_medium",
+            room_assignments,
+            overlay,
+        )
+        self.assertEqual("epuck_2", first_robot)
+
+        room_assignments[first_robot] = {"room": "n_medium", "helper": True}
+        second_robot = supervisor.select_robot_for_stalled_room(
+            "sw_large",
+            room_assignments,
+            overlay,
+            excluded_robots={first_robot},
+        )
+
+        self.assertNotEqual(first_robot, second_robot)
+
+    def test_stalled_small_room_redirect_stays_on_stalled_room(self):
+        supervisor = load_supervisor_module()
+        overlay = supervisor.CleaningOverlay.__new__(supervisor.CleaningOverlay)
+        overlay.room_tile_counts = {room: 20 for room in supervisor.ROOM_TASKS}
+        overlay.dirty_tiles = {
+            ("se_small", col_index, 0)
+            for col_index in range(12)
+        } | {
+            ("ne_large", col_index, 0)
+            for col_index in range(8)
+        }
+        room_assignments = {
+            "epuck_1": {"room": "se_small"},
+            "epuck_2": {"room": "se_small", "helper": True},
+            "epuck_3": {"room": "ne_large"},
+            "epuck_4": {"room": "s_medium"},
+        }
+
+        redirect_room = supervisor.select_redirect_room_for_stalled_progress(
+            "se_small",
+            room_assignments,
+            {"nw_small", "n_medium", "sw_large", "s_medium"},
+            overlay,
+        )
+
+        self.assertEqual("se_small", redirect_room)
+
     def test_reassignment_selects_least_supported_unfinished_room(self):
         supervisor = load_supervisor_module()
         overlay = supervisor.CleaningOverlay.__new__(supervisor.CleaningOverlay)
@@ -456,6 +729,33 @@ class CoverageWaypointTests(unittest.TestCase):
             "epuck_1",
             room_assignments,
             {"nw_small"},
+            overlay,
+        )
+
+        self.assertEqual("ne_large", next_room)
+
+    def test_reassignment_prefers_large_room_below_target_over_small_room(self):
+        supervisor = load_supervisor_module()
+        overlay = supervisor.CleaningOverlay.__new__(supervisor.CleaningOverlay)
+        overlay.room_tile_counts = {room: 20 for room in supervisor.ROOM_TASKS}
+        overlay.dirty_tiles = {
+            ("se_small", col_index, 0)
+            for col_index in range(14)
+        } | {
+            ("ne_large", col_index, 0)
+            for col_index in range(4)
+        }
+        room_assignments = {
+            "epuck_1": {"room": "nw_small"},
+            "epuck_2": {"room": "se_small"},
+            "epuck_3": {"room": "se_small", "helper": True},
+            "epuck_4": {"room": "ne_large"},
+        }
+
+        next_room = supervisor.select_reassignment_room(
+            "epuck_1",
+            room_assignments,
+            {"nw_small", "n_medium", "sw_large", "s_medium"},
             overlay,
         )
 
