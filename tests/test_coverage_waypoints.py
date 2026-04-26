@@ -93,6 +93,34 @@ class CoverageWaypointTests(unittest.TestCase):
         self.assertEqual(full_max_x, max(waypoint[0] for waypoint in right_lane))
         self.assertLessEqual(left_max_x, right_min_x)
 
+    def test_south_room_sweep_starts_near_hub_doorway(self):
+        supervisor = load_supervisor_module()
+
+        first_waypoint = supervisor.generate_coverage_waypoints("s_medium")[0]
+        _, _, _, max_y = supervisor.ROOM_TASKS["s_medium"]["bounds"]
+
+        self.assertEqual(
+            round(max_y - supervisor.COVERAGE_MARGIN_M, 3),
+            first_waypoint[1],
+        )
+
+    def test_split_lanes_start_on_different_sides(self):
+        supervisor = load_supervisor_module()
+
+        left_lane = supervisor.generate_coverage_waypoints(
+            "ne_large",
+            lane_index=0,
+            lane_count=2,
+        )
+        right_lane = supervisor.generate_coverage_waypoints(
+            "ne_large",
+            lane_index=1,
+            lane_count=2,
+        )
+
+        self.assertLess(left_lane[0][0], right_lane[0][0])
+        self.assertNotEqual(left_lane[0], right_lane[0])
+
     def test_coverage_lane_for_robot_uses_stable_room_order(self):
         supervisor = load_supervisor_module()
         room_assignments = {
@@ -262,6 +290,18 @@ class CoverageWaypointTests(unittest.TestCase):
         self.assertEqual(
             "driving_to_room",
             controller.robot_phase(True, False, (1.0, 1.0), False, False, "sweep"),
+        )
+        self.assertEqual(
+            "waiting_for_route",
+            controller.robot_phase(
+                True,
+                False,
+                (1.0, 1.0),
+                False,
+                False,
+                "sweep",
+                assignment_wait_steps_remaining=4,
+            ),
         )
         self.assertEqual(
             "sweeping",
@@ -674,6 +714,19 @@ class CoverageWaypointTests(unittest.TestCase):
 
         self.assertTrue(stuck)
         self.assertEqual("blocked by nearby obstacle", reason)
+
+    def test_route_start_delay_does_not_count_as_stuck_motion(self):
+        supervisor = load_supervisor_module()
+        status = {
+            "launch": {"complete": True, "timed_out": False},
+            "assignment_target_reached": False,
+            "assignment_route": {"waiting_steps_remaining": 12},
+            "coverage": {"room": "n_medium", "complete": False},
+        }
+
+        self.assertFalse(
+            supervisor.robot_should_be_moving(status, {"room": "n_medium"})
+        )
 
     def test_robot_motion_monitor_resets_when_robot_moves_enough(self):
         supervisor = load_supervisor_module()
@@ -1138,18 +1191,30 @@ class CoverageWaypointTests(unittest.TestCase):
             assignment["route"],
         )
 
-    def test_assignment_route_leaves_current_room_through_doorway(self):
+    def test_assignment_route_graph_shortens_room_to_room_travel(self):
         supervisor = load_supervisor_module()
         pose = {"x_m": -2.85, "y_m": 2.2}
 
         route = supervisor.generate_assignment_route(pose, "ne_large")
+        old_center_route = [
+            [-2.25, 0.93],
+            [-2.25, 0.57],
+            supervisor.HUB_ROUTE_WAYPOINT,
+            [1.85, 0.57],
+            [1.85, 0.93],
+            [1.85, 1.875],
+        ]
 
         self.assertEqual([-2.25, 0.93], route[0])
         self.assertEqual([-2.25, 0.57], route[1])
-        self.assertIn([0.0, 0.0], route)
+        self.assertNotIn(supervisor.HUB_ROUTE_WAYPOINT, route)
         self.assertEqual([1.85, 0.57], route[-3])
         self.assertEqual([1.85, 0.93], route[-2])
         self.assertEqual([1.85, 1.875], route[-1])
+        self.assertLess(
+            supervisor.route_distance_m(pose, route),
+            supervisor.route_distance_m(pose, old_center_route),
+        )
 
     def test_assignment_route_from_hub_skips_shared_center_waypoint(self):
         supervisor = load_supervisor_module()
@@ -1161,6 +1226,35 @@ class CoverageWaypointTests(unittest.TestCase):
         self.assertEqual([-0.4, 0.57], route[0])
         self.assertEqual([-0.4, 0.93], route[1])
         self.assertEqual([-0.4, 1.875], route[2])
+
+    def test_assignment_route_can_end_at_lane_start(self):
+        supervisor = load_supervisor_module()
+        pose = {"x_m": -0.3, "y_m": 0.1}
+        lane_start = supervisor.generate_coverage_waypoints("n_medium")[0]
+
+        route = supervisor.generate_assignment_route(
+            pose,
+            "n_medium",
+            final_waypoint=lane_start,
+        )
+
+        self.assertEqual(lane_start, route[-1])
+
+    def test_traffic_reservations_stagger_shared_hub_routes(self):
+        supervisor = load_supervisor_module()
+        reservations = supervisor.TrafficReservationBook()
+        resources = ["hub:all", "hub:north", "doorway:n_medium"]
+
+        first = reservations.reserve("epuck_1", resources, step_count=10)
+        second = reservations.reserve("epuck_2", resources, step_count=10)
+
+        self.assertEqual(0, first["start_delay_steps"])
+        self.assertEqual(
+            supervisor.TRAFFIC_RESOURCE_STAGGER_STEPS,
+            second["start_delay_steps"],
+        )
+        self.assertGreater(second["conflict_count"], 0)
+        self.assertEqual(1, second["doorway_conflicts"])
 
     def test_send_assignment_commands_targets_one_robot(self):
         supervisor = load_supervisor_module()
@@ -1204,6 +1298,51 @@ class CoverageWaypointTests(unittest.TestCase):
         self.assertEqual("sweep", plan_command["plan_kind"])
         self.assertEqual(0, plan_command["lane_index"])
         self.assertEqual(1, plan_command["lane_count"])
+
+    def test_send_assignment_commands_adds_route_delay_and_metrics(self):
+        supervisor = load_supervisor_module()
+
+        class FakeEmitter:
+            def __init__(self):
+                self.messages = []
+
+            def send(self, payload):
+                self.messages.append(payload)
+
+        reservations = supervisor.TrafficReservationBook()
+        status = {"pose": {"x_m": -0.3, "y_m": 0.1}}
+        first_assignment = supervisor.build_assignment(status, "n_medium")
+        second_assignment = supervisor.build_assignment(status, "n_medium")
+
+        supervisor.send_assignment_commands(
+            FakeEmitter(),
+            "epuck_1",
+            first_assignment,
+            {"epuck_1": first_assignment},
+            robot_status=status,
+            traffic_reservations=reservations,
+            step_count=20,
+        )
+
+        emitter = FakeEmitter()
+        supervisor.send_assignment_commands(
+            emitter,
+            "epuck_2",
+            second_assignment,
+            {"epuck_2": second_assignment},
+            robot_status=status,
+            traffic_reservations=reservations,
+            step_count=20,
+        )
+
+        command = json.loads(emitter.messages[0])
+        self.assertEqual(
+            supervisor.TRAFFIC_RESOURCE_STAGGER_STEPS,
+            command["start_delay_steps"],
+        )
+        self.assertGreater(command["path_metrics"]["planned_distance_m"], 0.0)
+        self.assertIn("hub:all", command["path_metrics"]["resources"])
+        self.assertGreater(command["path_metrics"]["doorway_conflicts"], 0)
 
     def test_send_assignment_commands_uses_split_lane_when_room_has_helpers(self):
         supervisor = load_supervisor_module()

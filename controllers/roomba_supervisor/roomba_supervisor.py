@@ -54,6 +54,8 @@ ROOM_PROGRESS_MIN_DELTA_PERCENT = 0.1
 ROOM_PROGRESS_ALERT_COOLDOWN_STEPS = 600
 SMALL_ROOM_MAX_PRIMARY_ROBOTS = 1
 LARGE_ROOM_MAX_PRIMARY_ROBOTS = 2
+TRAFFIC_RESOURCE_STAGGER_STEPS = 24
+TRAFFIC_MAX_START_DELAY_STEPS = 120
 FLOOR_MIN_X_M = -3.0
 FLOOR_MIN_Y_M = -3.0
 DIRTY_TILE_COLOR = [0.72, 0.56, 0.32]
@@ -165,32 +167,250 @@ def append_route_waypoint(route, waypoint):
     route.append(waypoint)
 
 
-def generate_assignment_route(pose, target_room):
+def point_distance_m(first_point, second_point):
+    """Return ground distance between two [x, y] points."""
+    return math.hypot(
+        second_point[0] - first_point[0],
+        second_point[1] - first_point[1],
+    )
+
+
+def pose_point(pose):
+    """Return a rounded [x, y] point for a pose dictionary."""
+    if not isinstance(pose, dict):
+        return None
+    x_m = pose.get("x_m")
+    y_m = pose.get("y_m")
+    if not isinstance(x_m, (int, float)) or not isinstance(y_m, (int, float)):
+        return None
+    return [round(x_m, 3), round(y_m, 3)]
+
+
+def route_distance_m(pose, route):
+    """Return the planned distance from a pose through a route."""
+    start_point = pose_point(pose)
+    if start_point is None:
+        return 0.0
+
+    distance_m = 0.0
+    previous_point = start_point
+    for waypoint in route:
+        if not isinstance(waypoint, (list, tuple)) or len(waypoint) != 2:
+            continue
+        point = [float(waypoint[0]), float(waypoint[1])]
+        distance_m += point_distance_m(previous_point, point)
+        previous_point = point
+    return distance_m
+
+
+def room_hub_node(room):
+    """Return the route graph node name for one room's hub doorway."""
+    return f"hub:{room}"
+
+
+def room_side(room):
+    """Return which side of the central hub the room connects to."""
+    _, center_y_m = ROOM_TASKS[room]["center"]
+    return "north" if center_y_m > 0.0 else "south"
+
+
+def hub_route_graph():
+    """
+    Build a tiny graph over room doorways on the central hub side.
+
+    Every doorway can see every other doorway across the open hub, so the
+    shortest graph path is usually direct. Keeping this as a graph gives the
+    supervisor one clear place to add future hallway obstacles or no-go areas.
+    """
+    nodes = {
+        room_hub_node(room): room_doorway_waypoints(room)[1]
+        for room in ROOM_TASKS
+    }
+    edges = {node: {} for node in nodes}
+    for first_node, first_point in nodes.items():
+        for second_node, second_point in nodes.items():
+            if first_node == second_node:
+                continue
+            edges[first_node][second_node] = point_distance_m(
+                first_point,
+                second_point,
+            )
+    return nodes, edges
+
+
+def shortest_hub_route_nodes(source_room, target_room):
+    """Return the shortest route graph node path between two room doorways."""
+    if source_room == target_room:
+        return [room_hub_node(target_room)]
+
+    nodes, edges = hub_route_graph()
+    source_node = room_hub_node(source_room)
+    target_node = room_hub_node(target_room)
+    if source_node not in nodes or target_node not in nodes:
+        return [source_node, target_node]
+
+    open_nodes = {source_node}
+    distances = {source_node: 0.0}
+    previous_nodes = {}
+    visited_nodes = set()
+
+    while open_nodes:
+        current_node = min(open_nodes, key=lambda node: distances[node])
+        open_nodes.remove(current_node)
+        if current_node == target_node:
+            break
+        visited_nodes.add(current_node)
+
+        for neighbor, edge_cost in edges[current_node].items():
+            if neighbor in visited_nodes:
+                continue
+            candidate_distance = distances[current_node] + edge_cost
+            if candidate_distance >= distances.get(neighbor, float("inf")):
+                continue
+            distances[neighbor] = candidate_distance
+            previous_nodes[neighbor] = current_node
+            open_nodes.add(neighbor)
+
+    if target_node not in distances:
+        return [source_node, target_node]
+
+    path = [target_node]
+    while path[-1] != source_node:
+        path.append(previous_nodes[path[-1]])
+    path.reverse()
+    return path
+
+
+def shortest_hub_route_waypoints(source_room, target_room):
+    """Return hub-side doorway waypoints for the shortest room-to-room route."""
+    nodes, _ = hub_route_graph()
+    return [
+        nodes[node_name]
+        for node_name in shortest_hub_route_nodes(source_room, target_room)
+        if node_name in nodes
+    ]
+
+
+def traffic_resource_keys(pose, target_room):
+    """Return coarse doorway and hub resources used by an assignment route."""
+    resources = []
+    current_room = room_for_pose(pose)
+    if current_room == target_room:
+        return [f"room:{target_room}"]
+
+    if current_room is not None:
+        resources.append(f"doorway:{current_room}")
+        source_side = room_side(current_room)
+    else:
+        source_side = None
+
+    target_side = room_side(target_room)
+    resources.append("hub:all")
+    if source_side is None:
+        resources.append(f"hub:{target_side}")
+    elif source_side == target_side:
+        resources.append(f"hub:{target_side}")
+    else:
+        resources.append("hub:cross")
+    resources.append(f"doorway:{target_room}")
+    return list(dict.fromkeys(resources))
+
+
+def generate_assignment_route(pose, target_room, final_waypoint=None):
     """Build a doorway-aware route from the robot's current room to a target room."""
     route = []
     current_room = room_for_pose(pose)
     target_x_m, target_y_m = ROOM_TASKS[target_room]["center"]
-    target_center = [round(target_x_m, 3), round(target_y_m, 3)]
+    if final_waypoint is None:
+        target_point = [round(target_x_m, 3), round(target_y_m, 3)]
+    else:
+        target_point = [round(final_waypoint[0], 3), round(final_waypoint[1], 3)]
 
     if current_room == target_room:
-        return [target_center]
+        return [target_point]
 
     if current_room is not None and current_room != target_room:
         current_inside, current_hub = room_doorway_waypoints(current_room)
         append_route_waypoint(route, current_inside)
         append_route_waypoint(route, current_hub)
+        for waypoint in shortest_hub_route_waypoints(current_room, target_room)[1:]:
+            append_route_waypoint(route, waypoint)
+    else:
+        _, target_hub = room_doorway_waypoints(target_room)
+        append_route_waypoint(route, target_hub)
 
-    # Robots already in the central hub should fan out straight to their
-    # destination doorways. Sending every hub robot through the exact center
-    # makes the first assignment look like a traffic jam.
-    if current_room is not None:
-        append_route_waypoint(route, HUB_ROUTE_WAYPOINT)
-
-    target_inside, target_hub = room_doorway_waypoints(target_room)
-    append_route_waypoint(route, target_hub)
+    target_inside, _ = room_doorway_waypoints(target_room)
     append_route_waypoint(route, target_inside)
-    append_route_waypoint(route, target_center)
+    append_route_waypoint(route, target_point)
     return route
+
+
+class TrafficReservationBook:
+    """
+    Coarsely stagger robots that would use the same doorway or hub corridor.
+
+    This is intentionally simple: it is like telling kids to go through a
+    narrow doorway one at a time. It does not reserve exact geometry forever;
+    it just spaces route starts enough to prevent the first few seconds of a
+    shared route from becoming a pileup.
+    """
+
+    def __init__(self):
+        self.next_available_steps = {}
+        self.total_planned_distance_m = 0.0
+        self.total_wait_steps = 0
+        self.route_conflicts = 0
+        self.doorway_conflicts = 0
+
+    def reserve(self, robot_name, resources, step_count):
+        """Reserve resources and return the start delay and conflict metrics."""
+        unique_resources = list(dict.fromkeys(resources))
+        start_step = step_count
+        conflict_resources = []
+        for resource in unique_resources:
+            available_step = self.next_available_steps.get(resource, step_count)
+            if available_step > step_count:
+                conflict_resources.append(resource)
+            if available_step > start_step:
+                start_step = available_step
+
+        start_delay_steps = max(0, start_step - step_count)
+        start_delay_steps = min(start_delay_steps, TRAFFIC_MAX_START_DELAY_STEPS)
+        reserved_until = step_count + start_delay_steps + TRAFFIC_RESOURCE_STAGGER_STEPS
+        for resource in unique_resources:
+            self.next_available_steps[resource] = max(
+                self.next_available_steps.get(resource, step_count),
+                reserved_until,
+            )
+
+        doorway_conflicts = sum(
+            1 for resource in conflict_resources
+            if resource.startswith("doorway:")
+        )
+        self.total_wait_steps += start_delay_steps
+        self.route_conflicts += len(conflict_resources)
+        self.doorway_conflicts += doorway_conflicts
+        return {
+            "robot": robot_name,
+            "start_delay_steps": start_delay_steps,
+            "conflict_count": len(conflict_resources),
+            "doorway_conflicts": doorway_conflicts,
+            "conflict_resources": conflict_resources,
+            "reserved_resources": unique_resources,
+        }
+
+    def record_distance(self, distance_m):
+        """Add one planned assignment distance to the run metrics."""
+        self.total_planned_distance_m += distance_m
+
+    def summary(self):
+        """Return rounded path-efficiency metrics for logging."""
+        return {
+            "planned_distance_m": round(self.total_planned_distance_m, 2),
+            "waiting_steps": self.total_wait_steps,
+            "route_conflicts": self.route_conflicts,
+            "doorway_conflicts": self.doorway_conflicts,
+        }
 
 
 class GlobalOccupancyGrid:
@@ -634,11 +854,8 @@ class TaskAllocator:
     def assignment_cost(self, robot_status, room):
         """Return the cost of sending one robot to one room."""
         pose = robot_status["pose"]
-        room_x_m, room_y_m = self.rooms[room]["center"]
-        distance_m = math.hypot(
-            room_x_m - pose["x_m"],
-            room_y_m - pose["y_m"],
-        )
+        route = generate_assignment_route(pose, room)
+        distance_m = route_distance_m(pose, route)
         area_m2 = self.rooms[room]["area_m2"]
         return self.distance_weight * distance_m + self.area_weight * area_m2
 
@@ -722,9 +939,12 @@ def generate_coverage_waypoints(room, lane_index=0, lane_count=1):
         y_m += COVERAGE_ROW_SPACING_M
     if not row_positions or row_positions[-1] < sweep_max_y - 1e-6:
         row_positions.append(sweep_max_y)
+    if ROOM_TASKS[room]["center"][1] < 0.0:
+        row_positions.reverse()
 
+    start_from_left = lane_index % 2 == 0
     for row_index, y_m in enumerate(row_positions):
-        if row_index % 2 == 0:
+        if (row_index % 2 == 0) == start_from_left:
             waypoints.append([round(sweep_min_x, 3), round(y_m, 3)])
             waypoints.append([round(sweep_max_x, 3), round(y_m, 3)])
         else:
@@ -1228,6 +1448,9 @@ def robot_should_be_moving(status, assignment):
         return True
 
     if not status.get("assignment_target_reached", False):
+        assignment_route = status.get("assignment_route", {})
+        if assignment_route.get("waiting_steps_remaining", 0) > 0:
+            return False
         return True
 
     coverage = status.get("coverage", {})
@@ -1574,18 +1797,94 @@ def select_stuck_recovery_room(
 
 def build_assignment(robot_status, room, helper=False):
     """Create one assignment dictionary from the robot pose to a room."""
-    room_x_m, room_y_m = ROOM_TASKS[room]["center"]
     pose = robot_status["pose"]
-    distance_m = math.hypot(room_x_m - pose["x_m"], room_y_m - pose["y_m"])
+    route = generate_assignment_route(pose, room)
+    distance_m = route_distance_m(pose, route)
     area_m2 = ROOM_TASKS[room]["area_m2"]
     cost = MRTA_DISTANCE_WEIGHT * distance_m + MRTA_AREA_WEIGHT * area_m2
     return {
         "room": room,
         "cost": round(cost, 3),
         "target": ROOM_TASKS[room]["center"],
-        "route": generate_assignment_route(pose, room),
+        "route": route,
         "helper": helper,
     }
+
+
+def prepare_assignment_for_dispatch(
+    robot_name,
+    assignment,
+    robot_status=None,
+    room_assignments=None,
+    traffic_reservations=None,
+    step_count=0,
+):
+    """Refresh route, lane, delay, and metric fields before sending a task."""
+    lane_index = 0
+    lane_count = 1
+    if room_assignments is not None:
+        lane_index, lane_count = coverage_lane_for_robot(
+            robot_name,
+            room_assignments,
+        )
+
+    coverage_plan = generate_coverage_waypoints(
+        assignment["room"],
+        lane_index,
+        lane_count,
+    )
+    route_target = (
+        coverage_plan[0]
+        if coverage_plan
+        else [
+            round(ROOM_TASKS[assignment["room"]]["center"][0], 3),
+            round(ROOM_TASKS[assignment["room"]]["center"][1], 3),
+        ]
+    )
+
+    pose = None
+    if isinstance(robot_status, dict):
+        pose = robot_status.get("pose")
+
+    route = assignment.get("route", [assignment["target"]])
+    if pose is not None:
+        route = generate_assignment_route(
+            pose,
+            assignment["room"],
+            final_waypoint=route_target,
+        )
+
+    planned_distance_m = route_distance_m(pose, route)
+    resources = traffic_resource_keys(pose, assignment["room"])
+    reservation = {
+        "start_delay_steps": 0,
+        "conflict_count": 0,
+        "doorway_conflicts": 0,
+        "conflict_resources": [],
+        "reserved_resources": resources,
+    }
+    if traffic_reservations is not None:
+        reservation = traffic_reservations.reserve(
+            robot_name,
+            resources,
+            step_count,
+        )
+        traffic_reservations.record_distance(planned_distance_m)
+
+    assignment["target"] = route_target
+    assignment["route"] = route
+    assignment["lane_index"] = lane_index
+    assignment["lane_count"] = lane_count
+    assignment["start_delay_steps"] = reservation["start_delay_steps"]
+    assignment["path_metrics"] = {
+        "planned_distance_m": round(planned_distance_m, 3),
+        "start_delay_steps": reservation["start_delay_steps"],
+        "route_conflicts": reservation["conflict_count"],
+        "doorway_conflicts": reservation["doorway_conflicts"],
+        "resources": reservation["reserved_resources"],
+        "conflict_resources": reservation["conflict_resources"],
+    }
+    return coverage_plan
 
 
 def send_assignment_commands(
@@ -1594,8 +1893,19 @@ def send_assignment_commands(
     assignment,
     room_assignments=None,
     send_coverage=True,
+    robot_status=None,
+    traffic_reservations=None,
+    step_count=0,
 ):
     """Send the room target and coverage path to one robot."""
+    coverage_plan = prepare_assignment_for_dispatch(
+        robot_name,
+        assignment,
+        robot_status,
+        room_assignments,
+        traffic_reservations,
+        step_count,
+    )
     emitter.send(
         json.dumps(
             {
@@ -1605,32 +1915,22 @@ def send_assignment_commands(
                 "target": assignment["target"],
                 "route": assignment.get("route", [assignment["target"]]),
                 "cost": assignment["cost"],
+                "start_delay_steps": assignment.get("start_delay_steps", 0),
+                "path_metrics": assignment.get("path_metrics", {}),
             }
         )
     )
     if not send_coverage:
         return []
 
-    lane_index = 0
-    lane_count = 1
-    if room_assignments is not None:
-        lane_index, lane_count = coverage_lane_for_robot(
-            robot_name,
-            room_assignments,
-        )
-    coverage_plan = generate_coverage_waypoints(
-        assignment["room"],
-        lane_index,
-        lane_count,
-    )
     send_coverage_plan(
         emitter,
         robot_name,
         assignment["room"],
         coverage_plan,
         plan_kind="sweep",
-        lane_index=lane_index,
-        lane_count=lane_count,
+        lane_index=assignment["lane_index"],
+        lane_count=assignment["lane_count"],
     )
     return coverage_plan
 
@@ -1796,6 +2096,7 @@ def run():
     room_progress_monitors = {}
     last_scan_match_log_steps = {}
     last_map_update_log_steps = {}
+    traffic_reservations = TrafficReservationBook()
     completed_rooms = set()
     completed_robot_rooms = {}
     assignments_sent = False
@@ -1925,11 +2226,16 @@ def run():
                         robot_name,
                         assignment,
                         room_assignments,
+                        robot_status=latest_robot_status.get(robot_name),
+                        traffic_reservations=traffic_reservations,
+                        step_count=step_count,
                     )
                     print(
                         f"[supervisor] Assigned {robot_name} -> "
                         f"{assignment['room']} cost={assignment['cost']:.3f} "
-                        f"coverage_waypoints={len(coverage_plans[robot_name])}"
+                        f"coverage_waypoints={len(coverage_plans[robot_name])} "
+                        f"path={assignment['path_metrics']['planned_distance_m']:.2f}m "
+                        f"wait={assignment['start_delay_steps']} step(s)"
                     )
                 assignments_sent = True
 
@@ -1980,6 +2286,9 @@ def run():
                     next_assignment,
                     room_assignments,
                     send_coverage=False,
+                    robot_status=status,
+                    traffic_reservations=traffic_reservations,
+                    step_count=step_count,
                 )
                 coverage_plans.update(
                     send_room_coverage_plans(
@@ -2073,6 +2382,9 @@ def run():
                     next_assignment,
                     room_assignments,
                     send_coverage=False,
+                    robot_status=status,
+                    traffic_reservations=traffic_reservations,
+                    step_count=step_count,
                 )
                 coverage_plans.update(
                     send_room_coverage_plans(
@@ -2187,6 +2499,9 @@ def run():
                     next_assignment,
                     room_assignments,
                     send_coverage=False,
+                    robot_status=status,
+                    traffic_reservations=traffic_reservations,
+                    step_count=step_count,
                 )
                 coverage_plans.update(
                     send_room_coverage_plans(
@@ -2211,11 +2526,15 @@ def run():
         if step_count % COMMUNICATION_SUMMARY_INTERVAL_STEPS == 0:
             connected_count = len(latest_robot_status)
             progress_snapshot = room_progress_snapshot(cleaning_overlay)
+            path_summary = traffic_reservations.summary()
             print(
                 f"[supervisor] Robot status: "
                 f"{connected_count}/{len(EXPECTED_ROBOTS)} reporting, "
                 f"global_map free={global_grid.free_cell_count} "
                 f"walls={global_grid.wall_cell_count} "
+                f"path_distance={path_summary['planned_distance_m']:.2f}m "
+                f"path_wait={path_summary['waiting_steps']} step(s) "
+                f"doorway_conflicts={path_summary['doorway_conflicts']} "
                 f"room_progress {format_room_progress(progress_snapshot)}"
             )
             for robot_name in EXPECTED_ROBOTS:
@@ -2244,6 +2563,7 @@ def run():
                     room_progress = cleaning_overlay.room_progress_percent(
                         assignment["room"]
                     )
+                route = status.get("assignment_route", {})
                 pose_text = f"pose=({pose['x_m']:.2f}, {pose['y_m']:.2f}) "
                 if actual_pose is not None:
                     pose_text += (
@@ -2256,6 +2576,7 @@ def run():
                     f"launch={launch['waypoint_index']}/{launch['waypoint_count']} "
                     f"phase={status.get('phase', 'unknown')} "
                     f"room={room} "
+                    f"route_wait={route.get('waiting_steps_remaining', 0)} "
                     f"coverage={coverage.get('waypoint_index', 0)}/"
                     f"{coverage.get('waypoint_count', 0)} "
                     f"{plan_kind} lane={lane_index + 1}/{lane_count} "
