@@ -7,6 +7,7 @@ layer for the future shared map and task assignment system.
 
 import json
 import math
+from pathlib import Path
 
 from controller import Supervisor
 
@@ -61,6 +62,19 @@ SMALL_ROOM_MAX_PRIMARY_ROBOTS = 1
 LARGE_ROOM_MAX_PRIMARY_ROBOTS = 2
 TRAFFIC_RESOURCE_STAGGER_STEPS = 24
 TRAFFIC_MAX_START_DELAY_STEPS = 120
+OPERATOR_CONTROL_FILE = "operator_controls.json"
+OPERATOR_STATE_FILE = "operator_state.json"
+OPERATOR_CONTROL_POLL_STEPS = 30
+OPERATOR_STATE_WRITE_STEPS = 15
+OPERATOR_MAX_PRIORITY_ZONES = 6
+OPERATOR_MAX_NO_GO_ZONES = 6
+OPERATOR_ZONE_Z_M = 0.018
+OPERATOR_NO_GO_ROUTE_MARGIN_M = 0.18
+OPERATOR_PRIORITY_ROUTE_WEIGHT = 0.45
+OPERATOR_PRIORITY_COLOR = [0.15, 0.35, 0.95]
+OPERATOR_NO_GO_COLOR = [0.9, 0.08, 0.05]
+OPERATOR_ZONE_TRANSPARENCY = 0.48
+OPERATOR_ZONE_HIDDEN_TRANSPARENCY = 1.0
 FLOOR_MIN_X_M = -3.0
 FLOOR_MIN_Y_M = -3.0
 DIRTY_TILE_COLOR = [0.72, 0.56, 0.32]
@@ -348,6 +362,505 @@ def generate_assignment_route(pose, target_room, final_waypoint=None):
     append_route_waypoint(route, target_inside)
     append_route_waypoint(route, target_point)
     return route
+
+
+def generate_route_to_room_hub(pose, target_room, final_waypoint=None):
+    """Route to the hub side of a room doorway without entering that room."""
+    target_hub = room_doorway_waypoints(target_room)[1]
+    if final_waypoint is None:
+        target_point = target_hub
+    else:
+        target_point = [round(final_waypoint[0], 3), round(final_waypoint[1], 3)]
+
+    start_point = pose_point(pose)
+    if start_point == target_point:
+        return [target_point]
+
+    route = []
+    current_room = room_for_pose(pose)
+    if current_room is not None and current_room != target_room:
+        current_inside, current_hub = room_doorway_waypoints(current_room)
+        append_route_waypoint(route, current_inside)
+        append_route_waypoint(route, current_hub)
+        for waypoint in shortest_hub_route_waypoints(current_room, target_room)[1:]:
+            append_route_waypoint(route, waypoint)
+    elif current_room is None:
+        append_route_waypoint(route, target_hub)
+
+    append_route_waypoint(route, target_point)
+    return route
+
+
+def normalized_bounds(value):
+    """Return [min_x, max_x, min_y, max_y] when a raw bounds value is usable."""
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        return None
+
+    try:
+        first_x, second_x, first_y, second_y = [float(entry) for entry in value]
+    except (TypeError, ValueError):
+        return None
+
+    min_x, max_x = sorted((first_x, second_x))
+    min_y, max_y = sorted((first_y, second_y))
+    if min_x == max_x or min_y == max_y:
+        return None
+    return [round(min_x, 3), round(max_x, 3), round(min_y, 3), round(max_y, 3)]
+
+
+def expanded_bounds(bounds, margin_m):
+    """Return a rectangle expanded by a small clearance margin."""
+    min_x, max_x, min_y, max_y = bounds
+    return [
+        round(min_x - margin_m, 3),
+        round(max_x + margin_m, 3),
+        round(min_y - margin_m, 3),
+        round(max_y + margin_m, 3),
+    ]
+
+
+def point_inside_bounds(point, bounds):
+    """Return True when a [x, y] point is inside a rectangle."""
+    if not isinstance(point, (list, tuple)) or len(point) != 2:
+        return False
+    min_x, max_x, min_y, max_y = bounds
+    return min_x <= point[0] <= max_x and min_y <= point[1] <= max_y
+
+
+def bounds_overlap(first_bounds, second_bounds):
+    """Return True when two rectangles share actual area, not only an edge."""
+    first_min_x, first_max_x, first_min_y, first_max_y = first_bounds
+    second_min_x, second_max_x, second_min_y, second_max_y = second_bounds
+    return not (
+        first_max_x <= second_min_x
+        or second_max_x <= first_min_x
+        or first_max_y <= second_min_y
+        or second_max_y <= first_min_y
+    )
+
+
+def _orientation(first, second, third):
+    """Return the turn direction for three points."""
+    value = (
+        (second[1] - first[1]) * (third[0] - second[0])
+        - (second[0] - first[0]) * (third[1] - second[1])
+    )
+    if abs(value) < 1e-9:
+        return 0
+    return 1 if value > 0.0 else 2
+
+
+def _point_on_segment(first, point, second):
+    """Return True when point sits on the line segment from first to second."""
+    return (
+        min(first[0], second[0]) - 1e-9 <= point[0] <= max(first[0], second[0]) + 1e-9
+        and min(first[1], second[1]) - 1e-9
+        <= point[1]
+        <= max(first[1], second[1]) + 1e-9
+    )
+
+
+def line_segments_intersect(first_start, first_end, second_start, second_end):
+    """Return True when two line segments touch or cross."""
+    first_orientation = _orientation(first_start, first_end, second_start)
+    second_orientation = _orientation(first_start, first_end, second_end)
+    third_orientation = _orientation(second_start, second_end, first_start)
+    fourth_orientation = _orientation(second_start, second_end, first_end)
+
+    if (
+        first_orientation != second_orientation
+        and third_orientation != fourth_orientation
+    ):
+        return True
+
+    if first_orientation == 0 and _point_on_segment(first_start, second_start, first_end):
+        return True
+    if second_orientation == 0 and _point_on_segment(first_start, second_end, first_end):
+        return True
+    if third_orientation == 0 and _point_on_segment(second_start, first_start, second_end):
+        return True
+    if fourth_orientation == 0 and _point_on_segment(second_start, first_end, second_end):
+        return True
+    return False
+
+
+def segment_intersects_bounds(start_point, end_point, bounds):
+    """Return True when a route segment enters or crosses a rectangular zone."""
+    if point_inside_bounds(start_point, bounds) or point_inside_bounds(end_point, bounds):
+        return True
+
+    min_x, max_x, min_y, max_y = bounds
+    edges = (
+        ([min_x, min_y], [max_x, min_y]),
+        ([max_x, min_y], [max_x, max_y]),
+        ([max_x, max_y], [min_x, max_y]),
+        ([min_x, max_y], [min_x, min_y]),
+    )
+    return any(
+        line_segments_intersect(start_point, end_point, edge_start, edge_end)
+        for edge_start, edge_end in edges
+    )
+
+
+def path_distance_between_points(points):
+    """Return distance through a plain list of [x, y] points."""
+    distance_m = 0.0
+    for index in range(1, len(points)):
+        distance_m += point_distance_m(points[index - 1], points[index])
+    return distance_m
+
+
+def detour_waypoints_around_bounds(start_point, end_point, bounds):
+    """
+    Return a short set of waypoints that steers one segment around a no-go box.
+
+    The no-go box is like a taped-off square on the floor. If the straight
+    path crosses the tape, the supervisor adds two corner waypoints just
+    outside the box so the robot walks around it.
+    """
+    if not segment_intersects_bounds(start_point, end_point, bounds):
+        return []
+
+    min_x, max_x, min_y, max_y = expanded_bounds(
+        bounds,
+        OPERATOR_NO_GO_ROUTE_MARGIN_M,
+    )
+    candidates = [
+        [[min_x, max_y], [max_x, max_y]],
+        [[max_x, max_y], [min_x, max_y]],
+        [[min_x, min_y], [max_x, min_y]],
+        [[max_x, min_y], [min_x, min_y]],
+        [[min_x, min_y], [min_x, max_y]],
+        [[min_x, max_y], [min_x, min_y]],
+        [[max_x, min_y], [max_x, max_y]],
+        [[max_x, max_y], [max_x, min_y]],
+    ]
+
+    clear_candidates = []
+    fallback_candidates = []
+    for candidate in candidates:
+        route_points = [start_point] + candidate + [end_point]
+        route_distance = path_distance_between_points(route_points)
+        fallback_candidates.append((route_distance, candidate))
+        if any(
+            segment_intersects_bounds(route_points[index], route_points[index + 1], bounds)
+            for index in range(len(route_points) - 1)
+        ):
+            continue
+        clear_candidates.append((route_distance, candidate))
+
+    choices = clear_candidates or fallback_candidates
+    choices.sort()
+    return [[round(point[0], 3), round(point[1], 3)] for point in choices[0][1]]
+
+
+def first_no_go_segment_hit(points, no_go_bounds):
+    """Return the first segment and no-go bounds crossed by a route."""
+    for index in range(len(points) - 1):
+        for bounds in no_go_bounds:
+            if segment_intersects_bounds(points[index], points[index + 1], bounds):
+                return index, bounds
+    return None, None
+
+
+def point_inside_any_bounds(point, bounds_list):
+    """Return True when a point is inside any rectangle in a bounds list."""
+    return any(point_inside_bounds(point, bounds) for bounds in bounds_list)
+
+
+def room_entry_blocked_by_no_go_zones(room, no_go_zones=None):
+    """Return True when an operator no-go zone blocks the room doorway."""
+    if not no_go_zones or room not in ROOM_TASKS:
+        return False
+
+    room_inside, room_hub = room_doorway_waypoints(room)
+    for zone in no_go_zones:
+        if not isinstance(zone, dict) or zone.get("bounds") is None:
+            continue
+        bounds = zone["bounds"]
+        if (
+            point_inside_bounds(room_inside, bounds)
+            or point_inside_bounds(room_hub, bounds)
+            or segment_intersects_bounds(room_hub, room_inside, bounds)
+        ):
+            return True
+    return False
+
+
+def route_segment_around_no_go_zones(start_point, end_point, no_go_bounds):
+    """Return waypoints from start to end after rechecking all no-go boxes."""
+    if point_inside_any_bounds(end_point, no_go_bounds):
+        return []
+
+    _, first_blocked_bounds = first_no_go_segment_hit(
+        [start_point, end_point],
+        no_go_bounds,
+    )
+    if first_blocked_bounds is None:
+        return [end_point]
+
+    candidates = []
+
+    def add_candidate(point, allow_blocked=False):
+        rounded_point = [round(point[0], 3), round(point[1], 3)]
+        if not allow_blocked and point_inside_any_bounds(rounded_point, no_go_bounds):
+            return
+        if rounded_point not in candidates:
+            candidates.append(rounded_point)
+
+    add_candidate(start_point, allow_blocked=True)
+    add_candidate(end_point, allow_blocked=True)
+    for bounds in no_go_bounds:
+        min_x, max_x, min_y, max_y = expanded_bounds(
+            bounds,
+            OPERATOR_NO_GO_ROUTE_MARGIN_M,
+        )
+        for candidate in (
+            [min_x, min_y],
+            [min_x, max_y],
+            [max_x, min_y],
+            [max_x, max_y],
+        ):
+            add_candidate(candidate)
+
+    start_candidate = candidates[0]
+
+    def segment_is_clear(first_point, second_point):
+        for bounds in no_go_bounds:
+            if not segment_intersects_bounds(first_point, second_point, bounds):
+                continue
+            if (
+                first_point == start_candidate
+                and point_inside_bounds(first_point, bounds)
+                and not point_inside_bounds(second_point, bounds)
+            ):
+                continue
+            return False
+        return True
+
+    start_index = 0
+    end_index = 1
+    distances = [math.inf for _ in candidates]
+    previous_indexes = [None for _ in candidates]
+    visited = set()
+    distances[start_index] = 0.0
+
+    while len(visited) < len(candidates):
+        current_index = None
+        current_distance = math.inf
+        for index, distance in enumerate(distances):
+            if index not in visited and distance < current_distance:
+                current_index = index
+                current_distance = distance
+        if current_index is None or math.isinf(current_distance):
+            break
+        if current_index == end_index:
+            break
+
+        visited.add(current_index)
+        current_point = candidates[current_index]
+        for neighbor_index, neighbor_point in enumerate(candidates):
+            if neighbor_index == current_index or neighbor_index in visited:
+                continue
+            if not segment_is_clear(current_point, neighbor_point):
+                continue
+            candidate_distance = current_distance + point_distance_m(
+                current_point,
+                neighbor_point,
+            )
+            if candidate_distance < distances[neighbor_index]:
+                distances[neighbor_index] = candidate_distance
+                previous_indexes[neighbor_index] = current_index
+
+    if math.isinf(distances[end_index]):
+        return []
+
+    path_indexes = []
+    current_index = end_index
+    while current_index is not None:
+        path_indexes.append(current_index)
+        current_index = previous_indexes[current_index]
+    path_indexes.reverse()
+    return [candidates[index] for index in path_indexes[1:]]
+
+
+def route_around_no_go_zones(route, no_go_zones=None, start_point=None):
+    """Return a route with extra waypoints inserted around operator no-go zones."""
+    if not no_go_zones:
+        return list(route)
+
+    no_go_bounds = [
+        zone.get("bounds")
+        for zone in no_go_zones
+        if isinstance(zone, dict) and zone.get("bounds") is not None
+    ]
+    if not no_go_bounds:
+        return list(route)
+
+    adjusted_route = []
+    previous_point = start_point
+    for waypoint in route:
+        if not isinstance(waypoint, (list, tuple)) or len(waypoint) != 2:
+            continue
+        target_point = [round(float(waypoint[0]), 3), round(float(waypoint[1]), 3)]
+        if point_inside_any_bounds(target_point, no_go_bounds):
+            break
+
+        if previous_point is None:
+            append_route_waypoint(adjusted_route, target_point)
+            previous_point = target_point
+            continue
+
+        segment_points = route_segment_around_no_go_zones(
+            previous_point,
+            target_point,
+            no_go_bounds,
+        )
+        if not segment_points:
+            break
+        for segment_point in segment_points:
+            append_route_waypoint(adjusted_route, segment_point)
+            previous_point = segment_point
+
+    return adjusted_route
+
+
+def route_reaches_final_waypoint(original_route, adjusted_route):
+    """Return True when a no-go adjusted route still reaches its intended end."""
+    if not original_route:
+        return True
+    if not adjusted_route:
+        return False
+    return adjusted_route[-1] == original_route[-1]
+
+
+def point_blocked_by_no_go_zones(point, no_go_zones=None):
+    """Return True when a waypoint sits inside an operator no-go zone."""
+    if not no_go_zones:
+        return False
+
+    return any(
+        isinstance(zone, dict)
+        and zone.get("bounds") is not None
+        and point_inside_bounds(point, zone["bounds"])
+        for zone in no_go_zones
+    )
+
+
+def coverage_plan_around_no_go_zones(coverage_plan, no_go_zones=None, start_point=None):
+    """Return coverage waypoints with blocked targets skipped and segments detoured."""
+    if not no_go_zones:
+        return list(coverage_plan)
+
+    adjusted_plan = []
+    previous_point = start_point
+    for waypoint in coverage_plan:
+        if not isinstance(waypoint, (list, tuple)) or len(waypoint) != 2:
+            continue
+        target_point = [round(float(waypoint[0]), 3), round(float(waypoint[1]), 3)]
+        if point_blocked_by_no_go_zones(target_point, no_go_zones):
+            continue
+
+        segment_points = route_around_no_go_zones(
+            [target_point],
+            no_go_zones,
+            start_point=previous_point,
+        )
+        if segment_points and segment_points[-1] != target_point:
+            continue
+        for segment_point in segment_points:
+            append_route_waypoint(adjusted_plan, segment_point)
+        if segment_points:
+            previous_point = adjusted_plan[-1]
+
+    return adjusted_plan
+
+
+def route_target_for_empty_coverage(room, no_go_zones=None, pose=None):
+    """Return a fallback target that does not sit inside an operator no-go zone."""
+    center_x_m, center_y_m = ROOM_TASKS[room]["center"]
+    room_center = [round(center_x_m, 3), round(center_y_m, 3)]
+    room_inside, room_hub = room_doorway_waypoints(room)
+    if room_entry_blocked_by_no_go_zones(room, no_go_zones):
+        candidates = [room_hub, pose_point(pose), HUB_ROUTE_WAYPOINT]
+    else:
+        candidates = [
+            room_center,
+            room_inside,
+            room_hub,
+            pose_point(pose),
+            HUB_ROUTE_WAYPOINT,
+        ]
+    for candidate in candidates:
+        if candidate is not None and not point_blocked_by_no_go_zones(
+            candidate,
+            no_go_zones,
+        ):
+            return candidate
+    return pose_point(pose) or room_hub
+
+
+def normalize_operator_zone(raw_zone, zone_kind):
+    """Normalize one operator priority or no-go zone definition."""
+    if not isinstance(raw_zone, dict):
+        return None
+
+    room = raw_zone.get("room")
+    bounds = normalized_bounds(raw_zone.get("bounds"))
+    if room in ROOM_TASKS and bounds is None:
+        bounds = list(ROOM_TASKS[room]["bounds"])
+    if bounds is None:
+        return None
+
+    name = raw_zone.get("name")
+    if not isinstance(name, str) or not name.strip():
+        name = room if room in ROOM_TASKS else f"{zone_kind}_zone"
+
+    try:
+        weight = float(raw_zone.get("weight", 1.0))
+    except (TypeError, ValueError):
+        weight = 1.0
+    weight = max(0.0, weight)
+
+    return {
+        "kind": zone_kind,
+        "name": name.strip(),
+        "room": room if room in ROOM_TASKS else None,
+        "bounds": bounds,
+        "weight": round(weight, 3),
+    }
+
+
+def priority_weight_for_room(priority_zones, room):
+    """Return the strongest operator priority weight affecting one room."""
+    if not priority_zones or room not in ROOM_TASKS:
+        return 0.0
+
+    room_bounds = ROOM_TASKS[room]["bounds"]
+    priority_weight = 0.0
+    for zone in priority_zones:
+        if not isinstance(zone, dict):
+            continue
+        zone_bounds = zone.get("bounds")
+        if zone_bounds is None:
+            continue
+        if zone.get("room") == room or bounds_overlap(zone_bounds, room_bounds):
+            priority_weight = max(priority_weight, zone.get("weight", 1.0))
+    return priority_weight
+
+
+def operator_zone_signature(zones):
+    """Return a stable signature for detecting operator zone changes."""
+    return tuple(
+        (
+            zone.get("name"),
+            tuple(zone.get("bounds", [])),
+            zone.get("room"),
+            zone.get("weight", 1.0),
+        )
+        for zone in zones
+        if isinstance(zone, dict)
+    )
 
 
 class TrafficReservationBook:
@@ -856,15 +1369,28 @@ class TaskAllocator:
         self.distance_weight = distance_weight
         self.area_weight = area_weight
 
-    def assignment_cost(self, robot_status, room):
+    def assignment_cost(self, robot_status, room, no_go_zones=None, priority_zones=None):
         """Return the cost of sending one robot to one room."""
         pose = robot_status["pose"]
-        route = generate_assignment_route(pose, room)
+        base_route = generate_assignment_route(pose, room)
+        route = route_around_no_go_zones(
+            base_route,
+            no_go_zones,
+            start_point=pose_point(pose),
+        )
+        if not route_reaches_final_waypoint(base_route, route):
+            return float("inf")
+
         distance_m = route_distance_m(pose, route)
         area_m2 = self.rooms[room]["area_m2"]
-        return self.distance_weight * distance_m + self.area_weight * area_m2
+        priority_weight = priority_weight_for_room(priority_zones, room)
+        return (
+            self.distance_weight * distance_m
+            + self.area_weight * area_m2
+            - OPERATOR_PRIORITY_ROUTE_WEIGHT * priority_weight
+        )
 
-    def assign(self, robot_statuses):
+    def assign(self, robot_statuses, no_go_zones=None, priority_zones=None):
         """Return room assignments that minimize total cost for this small team."""
         robots = [robot for robot in EXPECTED_ROBOTS if robot in robot_statuses]
         rooms = list(self.rooms)
@@ -873,37 +1399,62 @@ class TaskAllocator:
 
         best_assignments = None
         best_total_cost = None
+        best_assigned_count = -1
         remaining_rooms = set(rooms)
 
         def search(robot_index, current_assignments, current_cost):
-            nonlocal best_assignments, best_total_cost
+            nonlocal best_assignments, best_total_cost, best_assigned_count
 
             if robot_index >= len(robots):
-                if best_total_cost is None or current_cost < best_total_cost:
+                assigned_count = len(current_assignments)
+                if (
+                    assigned_count > best_assigned_count
+                    or (
+                        assigned_count == best_assigned_count
+                        and (
+                            best_total_cost is None
+                            or current_cost < best_total_cost
+                        )
+                    )
+                ):
+                    best_assigned_count = assigned_count
                     best_total_cost = current_cost
                     best_assignments = dict(current_assignments)
                 return
 
             robot = robots[robot_index]
             for room in sorted(remaining_rooms):
-                room_cost = self.assignment_cost(robot_statuses[robot], room)
-                total_cost = current_cost + room_cost
-                if best_total_cost is not None and total_cost >= best_total_cost:
+                room_cost = self.assignment_cost(
+                    robot_statuses[robot],
+                    room,
+                    no_go_zones,
+                    priority_zones,
+                )
+                if math.isinf(room_cost):
                     continue
+                total_cost = current_cost + room_cost
 
                 remaining_rooms.remove(room)
+                base_route = generate_assignment_route(
+                    robot_statuses[robot]["pose"],
+                    room,
+                )
+                route = route_around_no_go_zones(
+                    base_route,
+                    no_go_zones,
+                    start_point=pose_point(robot_statuses[robot]["pose"]),
+                )
                 current_assignments[robot] = {
                     "room": room,
                     "cost": round(room_cost, 3),
                     "target": self.rooms[room]["center"],
-                    "route": generate_assignment_route(
-                        robot_statuses[robot]["pose"],
-                        room,
-                    ),
+                    "route": route,
                 }
                 search(robot_index + 1, current_assignments, total_cost)
                 current_assignments.pop(robot)
                 remaining_rooms.add(room)
+
+            search(robot_index + 1, current_assignments, current_cost)
 
         search(0, {}, 0.0)
         return best_assignments or {}
@@ -979,6 +1530,26 @@ def coverage_lane_for_robot(robot_name, room_assignments):
         return 0, 1
 
     return robots_in_room.index(robot_name), len(robots_in_room)
+
+
+def pause_robot_assignment(robot_name, room_assignments, paused_assignments):
+    """Move a paused robot's task out of active room accounting."""
+    assignment = room_assignments.pop(robot_name, None)
+    if assignment is not None:
+        paused_assignments[robot_name] = assignment
+    else:
+        paused_assignments.pop(robot_name, None)
+    return assignment
+
+
+def resume_robot_assignment(robot_name, room_assignments, paused_assignments):
+    """Restore a paused robot's task when the operator resumes it."""
+    assignment = room_assignments.get(robot_name)
+    paused_assignment = paused_assignments.pop(robot_name, None)
+    if assignment is None and paused_assignment is not None:
+        room_assignments[robot_name] = paused_assignment
+        return paused_assignment
+    return assignment
 
 
 def get_actual_robot_pose(supervisor, robot_name):
@@ -1236,9 +1807,47 @@ class CleaningOverlay:
             cleaned_count += self.mark_clean_near(room, x_m, y_m)
         return cleaned_count
 
-    def dirty_tile_count(self, room):
-        """Return how many cleaning tiles in one room are still dirty."""
-        return sum(1 for tile_room, _, _ in self.dirty_tiles if tile_room == room)
+    def reset_progress(self):
+        """Return the cleaning overlay to its initial all-dirty hidden state."""
+        self.dirty_tiles = set(self.tile_centers)
+        self.tile_claims = {}
+        self.active_rooms = set()
+        if not self.enabled:
+            return
+
+        for appearance in self.tile_appearances.values():
+            appearance.getField("baseColor").setSFColor(DIRTY_TILE_COLOR)
+            appearance.getField("transparency").setSFFloat(HIDDEN_TILE_TRANSPARENCY)
+
+    def dirty_tile_count(
+        self,
+        room,
+        no_go_zones=None,
+        exclude_entry_blocked=True,
+    ):
+        """Return how many reachable cleaning tiles in one room are still dirty."""
+        can_filter_no_go = bool(no_go_zones) and (
+            hasattr(self, "rooms") or hasattr(self, "tile_centers")
+        )
+        if (
+            exclude_entry_blocked
+            and can_filter_no_go
+            and room_entry_blocked_by_no_go_zones(room, no_go_zones)
+        ):
+            return 0
+
+        dirty_count = 0
+        for tile_key in self.dirty_tiles:
+            tile_room, _, _ = tile_key
+            if tile_room != room:
+                continue
+            if can_filter_no_go and point_blocked_by_no_go_zones(
+                self.tile_center(tile_key),
+                no_go_zones,
+            ):
+                continue
+            dirty_count += 1
+        return dirty_count
 
     def tile_center(self, tile_key):
         """Return the world position of one tile center."""
@@ -1254,17 +1863,35 @@ class CleaningOverlay:
             round(start_y_m + row_index * CLEAN_TILE_SIZE_M, 3),
         ]
 
-    def cleaned_tile_count(self, room):
+    def cleaned_tile_count(
+        self,
+        room,
+        no_go_zones=None,
+        exclude_entry_blocked=True,
+    ):
         """Return how many cleaning tiles in one room have been cleaned."""
         total_tiles = self.room_tile_counts.get(room, 0)
-        return max(0, total_tiles - self.dirty_tile_count(room))
+        return max(
+            0,
+            total_tiles
+            - self.dirty_tile_count(room, no_go_zones, exclude_entry_blocked),
+        )
 
-    def room_progress_percent(self, room):
+    def room_progress_percent(
+        self,
+        room,
+        no_go_zones=None,
+        exclude_entry_blocked=True,
+    ):
         """Return how much of one room is clean, from 0 to 100."""
         total_tiles = self.room_tile_counts.get(room, 0)
         if total_tiles <= 0:
             return 0.0
-        return 100.0 * self.cleaned_tile_count(room) / total_tiles
+        return (
+            100.0
+            * self.cleaned_tile_count(room, no_go_zones, exclude_entry_blocked)
+            / total_tiles
+        )
 
     def dirty_tile_centers(self, room):
         """Return center points for the dirty tiles that remain in one room."""
@@ -1285,6 +1912,31 @@ class CleaningOverlay:
             tile_key: owner
             for tile_key, owner in self.tile_claims.items()
             if owner != robot_name
+        }
+
+    def release_robot_room_claims(self, robot_name, room):
+        """Forget dirty-tile claims owned by one robot in one room."""
+        self.tile_claims = {
+            tile_key: owner
+            for tile_key, owner in self.tile_claims.items()
+            if owner != robot_name or tile_key[0] != room
+        }
+
+    def release_robot_room_claims_except_centers(self, robot_name, room, centers):
+        """Keep only this robot's room claims whose tile centers are still planned."""
+        center_keys = {
+            tuple(round(float(coordinate), 3) for coordinate in center)
+            for center in centers
+            if isinstance(center, (list, tuple)) and len(center) == 2
+        }
+        self.tile_claims = {
+            tile_key: owner
+            for tile_key, owner in self.tile_claims.items()
+            if (
+                owner != robot_name
+                or tile_key[0] != room
+                or tuple(self.tile_center(tile_key)) in center_keys
+            )
         }
 
     def release_room_claims(self, room):
@@ -1310,6 +1962,8 @@ class CleaningOverlay:
         robot_pose=None,
         max_tiles=CLEANUP_TARGETS_PER_ROBOT,
         prefer_edges=False,
+        no_go_zones=None,
+        entry_blocked_is_reachable=False,
     ):
         """
         Reserve a small cleanup batch for one robot.
@@ -1319,6 +1973,17 @@ class CleaningOverlay:
         """
         if room not in self.rooms or max_tiles <= 0:
             return []
+        if (
+            not entry_blocked_is_reachable
+            and room_entry_blocked_by_no_go_zones(room, no_go_zones)
+        ):
+            return []
+
+        def tile_is_allowed(tile_key):
+            return not point_blocked_by_no_go_zones(
+                self.tile_center(tile_key),
+                no_go_zones,
+            )
 
         self.prune_cleaned_claims()
         claimed_by_robot = [
@@ -1327,6 +1992,7 @@ class CleaningOverlay:
             if owner == robot_name
             and tile_key in self.dirty_tiles
             and tile_key[0] == room
+            and tile_is_allowed(tile_key)
         ]
 
         open_tiles = [
@@ -1335,6 +2001,7 @@ class CleaningOverlay:
             if tile_key[0] == room
             and self.tile_claims.get(tile_key, robot_name) == robot_name
             and tile_key not in claimed_by_robot
+            and tile_is_allowed(tile_key)
         ]
 
         def sort_key(tile_key):
@@ -1387,9 +2054,389 @@ class CleaningOverlay:
         return [self.tile_center(tile_key) for tile_key in selected_tiles]
 
 
-def room_reached_coverage_goal(cleaning_overlay, room):
+def parse_operator_control_config(raw_config):
+    """Return normalized operator controls from a JSON object."""
+    if not isinstance(raw_config, dict):
+        raw_config = {}
+
+    def config_list(key):
+        value = raw_config.get(key, [])
+        return value if isinstance(value, list) else []
+
+    paused_robots = set()
+    for robot_name in config_list("paused_robots"):
+        if robot_name == "all" or robot_name in EXPECTED_ROBOTS:
+            paused_robots.add(robot_name)
+
+    priority_zones = []
+    for raw_zone in config_list("priority_zones"):
+        zone = normalize_operator_zone(raw_zone, "priority")
+        if zone is not None:
+            priority_zones.append(zone)
+
+    no_go_zones = []
+    for raw_zone in config_list("no_go_zones"):
+        zone = normalize_operator_zone(raw_zone, "no_go")
+        if zone is not None:
+            no_go_zones.append(zone)
+
+    redirects = []
+    raw_redirects = []
+    raw_redirects.extend(config_list("redirects"))
+    raw_redirects.extend(config_list("manual_redirects"))
+    for index, raw_redirect in enumerate(raw_redirects):
+        if not isinstance(raw_redirect, dict):
+            continue
+        robot_name = raw_redirect.get("robot")
+        room = raw_redirect.get("room")
+        if robot_name not in EXPECTED_ROBOTS or room not in ROOM_TASKS:
+            continue
+
+        redirect_id = raw_redirect.get("id")
+        if not isinstance(redirect_id, str) or not redirect_id.strip():
+            redirect_id = f"{robot_name}:{room}:{index}"
+        redirects.append(
+            {
+                "id": redirect_id.strip(),
+                "robot": robot_name,
+                "room": room,
+            }
+        )
+
+    sim_reset_request = None
+    raw_reset_request = raw_config.get("sim_reset_request")
+    if isinstance(raw_reset_request, dict):
+        reset_id = raw_reset_request.get("id")
+        if isinstance(reset_id, str) and reset_id.strip():
+            sim_reset_request = {"id": reset_id.strip()}
+            requested_at = raw_reset_request.get("requested_at")
+            try:
+                sim_reset_request["requested_at"] = round(float(requested_at), 3)
+            except (TypeError, ValueError):
+                pass
+
+    return {
+        "paused_robots": paused_robots,
+        "priority_zones": priority_zones[:OPERATOR_MAX_PRIORITY_ZONES],
+        "no_go_zones": no_go_zones[:OPERATOR_MAX_NO_GO_ZONES],
+        "redirects": redirects,
+        "sim_reset_request": sim_reset_request,
+    }
+
+
+def default_operator_control_config():
+    """Return the empty operator command file used at sim startup."""
+    return {
+        "paused_robots": [],
+        "priority_zones": [],
+        "no_go_zones": [],
+        "redirects": [],
+        "sim_reset_request": None,
+    }
+
+
+def default_operator_state_snapshot():
+    """Return the dashboard map state for a freshly reset simulation."""
+    return {
+        "step": None,
+        "rooms": [
+            {
+                "name": room,
+                "bounds": list(config["bounds"]),
+                "progress_percent": 0.0,
+                "dirty_tiles": 0,
+                "assigned_robots": [],
+                "completed": False,
+                "priority_zones": [],
+                "no_go_zones": [],
+            }
+            for room, config in ROOM_TASKS.items()
+        ],
+        "robots": [],
+        "operator": {
+            "paused_robots": [],
+            "priority_zones": [],
+            "no_go_zones": [],
+            "pending_redirects": [],
+            "sim_reset_request": None,
+            "last_error": "",
+        },
+        "traffic": {
+            "planned_distance_m": 0.0,
+            "waiting_steps": 0,
+            "doorway_conflicts": 0,
+        },
+    }
+
+
+def reset_operator_control_file(control_path):
+    """Clear stale operator commands when the Webots simulation starts over."""
+    path = Path(control_path)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = path.with_suffix(path.suffix + ".tmp")
+        temp_path.write_text(
+            json.dumps(default_operator_control_config(), indent=2) + "\n",
+            encoding="utf-8",
+        )
+        temp_path.replace(path)
+    except OSError as exc:
+        print(f"[supervisor] Could not reset operator controls: {exc}")
+        return False
+    return True
+
+
+class OperatorZoneOverlay:
+    """Draw operator priority and no-go rectangles on the Webots floor."""
+
+    def __init__(self, supervisor):
+        self.supervisor = supervisor
+        self.enabled = True
+        self.root_children = supervisor.getRoot().getField("children")
+        self.priority_slots = self.create_zone_slots(
+            "OPERATOR_PRIORITY",
+            OPERATOR_MAX_PRIORITY_ZONES,
+            OPERATOR_PRIORITY_COLOR,
+        )
+        self.no_go_slots = self.create_zone_slots(
+            "OPERATOR_NO_GO",
+            OPERATOR_MAX_NO_GO_ZONES,
+            OPERATOR_NO_GO_COLOR,
+        )
+
+    def create_zone_slots(self, prefix, max_slots, color):
+        """Create reusable flat rectangles for one zone type."""
+        slots = []
+        for index in range(max_slots):
+            def_name = f"{prefix}_{index}"
+            zone_source = (
+                f"DEF {def_name} Solid {{ "
+                f"translation 0 0 {OPERATOR_ZONE_Z_M:.3f} "
+                "children [ Shape { "
+                "appearance PBRAppearance { "
+                f"baseColor {color[0]:.3f} {color[1]:.3f} {color[2]:.3f} "
+                f"transparency {OPERATOR_ZONE_HIDDEN_TRANSPARENCY:.1f} "
+                "roughness 0.9 "
+                "} "
+                "geometry Box { size 0.050 0.050 0.006 } "
+                "} ] "
+                "}"
+            )
+            try:
+                self.root_children.importMFNodeFromString(-1, zone_source)
+                node = self.supervisor.getFromDef(def_name)
+                shape = node.getField("children").getMFNode(0)
+                appearance = shape.getField("appearance").getSFNode()
+                geometry = shape.getField("geometry").getSFNode()
+                slots.append(
+                    {
+                        "translation": node.getField("translation"),
+                        "appearance": appearance,
+                        "geometry": geometry,
+                    }
+                )
+            except Exception as exc:
+                self.enabled = False
+                print(f"[supervisor] Operator zone overlay disabled: {exc}")
+                return slots
+        return slots
+
+    def update_zones(self, priority_zones, no_go_zones):
+        """Refresh all visible operator zone rectangles."""
+        if not self.enabled:
+            return
+
+        self.update_zone_slots(self.priority_slots, priority_zones, OPERATOR_PRIORITY_COLOR)
+        self.update_zone_slots(self.no_go_slots, no_go_zones, OPERATOR_NO_GO_COLOR)
+
+    def update_zone_slots(self, slots, zones, color):
+        """Show active zones and hide unused rectangle slots."""
+        for index, slot in enumerate(slots):
+            if index >= len(zones):
+                self.hide_slot(slot)
+                continue
+
+            bounds = zones[index]["bounds"]
+            min_x, max_x, min_y, max_y = bounds
+            center_x_m = (min_x + max_x) / 2.0
+            center_y_m = (min_y + max_y) / 2.0
+            width_m = max(0.05, max_x - min_x)
+            height_m = max(0.05, max_y - min_y)
+            slot["translation"].setSFVec3f(
+                [center_x_m, center_y_m, OPERATOR_ZONE_Z_M]
+            )
+            slot["geometry"].getField("size").setSFVec3f(
+                [width_m, height_m, 0.006]
+            )
+            slot["appearance"].getField("baseColor").setSFColor(color)
+            slot["appearance"].getField("transparency").setSFFloat(
+                OPERATOR_ZONE_TRANSPARENCY
+            )
+
+    def hide_slot(self, slot):
+        """Hide an unused zone rectangle."""
+        slot["translation"].setSFVec3f([0.0, 0.0, OPERATOR_ZONE_Z_M])
+        slot["geometry"].getField("size").setSFVec3f([0.05, 0.05, 0.006])
+        slot["appearance"].getField("transparency").setSFFloat(
+            OPERATOR_ZONE_HIDDEN_TRANSPARENCY
+        )
+
+
+class OperatorControls:
+    """Read operator commands and keep their Webots visual state current."""
+
+    def __init__(self, supervisor, control_path=None):
+        self.supervisor = supervisor
+        if control_path is None:
+            repo_root = Path(__file__).resolve().parents[2]
+            control_path = repo_root / OPERATOR_CONTROL_FILE
+        self.control_path = Path(control_path)
+        self.paused_robots = set()
+        self.priority_zones = []
+        self.no_go_zones = []
+        self.redirects = []
+        self.sim_reset_request = None
+        self.processed_redirect_ids = set()
+        self.processed_sim_reset_ids = set()
+        self.last_mtime_ns = None
+        self.last_poll_step = -OPERATOR_CONTROL_POLL_STEPS
+        self.last_loaded_step = None
+        self.last_error = ""
+        try:
+            self.zone_overlay = OperatorZoneOverlay(supervisor)
+        except Exception as exc:
+            self.zone_overlay = None
+            print(f"[supervisor] Operator visual zones disabled: {exc}")
+
+    def load_if_due(self, step_count):
+        """Reload operator controls when the JSON file changes."""
+        if step_count - self.last_poll_step < OPERATOR_CONTROL_POLL_STEPS:
+            return False
+
+        self.last_poll_step = step_count
+        return self.load(step_count)
+
+    def load(self, step_count):
+        """Load controls from disk, returning True when the visible state changed."""
+        if not self.control_path.exists():
+            changed = (
+                self.last_mtime_ns is not None
+                or bool(self.paused_robots)
+                or bool(self.priority_zones)
+                or bool(self.no_go_zones)
+                or bool(self.redirects)
+                or self.sim_reset_request is not None
+            )
+            self.last_mtime_ns = None
+            self.last_error = ""
+            self.paused_robots = set()
+            self.priority_zones = []
+            self.no_go_zones = []
+            self.redirects = []
+            self.sim_reset_request = None
+            return changed
+
+        try:
+            stat = self.control_path.stat()
+        except OSError as exc:
+            self.last_error = f"read error: {exc}"
+            return True
+
+        if stat.st_mtime_ns == self.last_mtime_ns:
+            return False
+
+        try:
+            raw_config = json.loads(self.control_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            self.last_error = f"json error: {exc}"
+            return True
+
+        parsed = parse_operator_control_config(raw_config)
+        self.paused_robots = parsed["paused_robots"]
+        self.priority_zones = parsed["priority_zones"]
+        self.no_go_zones = parsed["no_go_zones"]
+        self.redirects = parsed["redirects"]
+        self.sim_reset_request = parsed["sim_reset_request"]
+        self.last_mtime_ns = stat.st_mtime_ns
+        self.last_loaded_step = step_count
+        self.last_error = ""
+        return True
+
+    def paused_robot_names(self):
+        """Return the concrete robot names currently paused by the operator."""
+        if "all" in self.paused_robots:
+            return set(EXPECTED_ROBOTS)
+        return {robot for robot in self.paused_robots if robot in EXPECTED_ROBOTS}
+
+    def pending_redirects(self):
+        """Return manual redirects that have not been applied yet."""
+        return [
+            redirect
+            for redirect in self.redirects
+            if redirect["id"] not in self.processed_redirect_ids
+        ]
+
+    def mark_redirect_processed(self, redirect_id):
+        """Remember that one manual redirect has already been applied."""
+        self.processed_redirect_ids.add(redirect_id)
+
+    def pending_sim_reset_request(self):
+        """Return a dashboard sim reset request that has not been used yet."""
+        if self.sim_reset_request is None:
+            return None
+        reset_id = self.sim_reset_request["id"]
+        if reset_id in self.processed_sim_reset_ids:
+            return None
+        return self.sim_reset_request
+
+    def mark_sim_reset_processed(self, reset_id):
+        """Remember that one dashboard sim reset request was handled."""
+        self.processed_sim_reset_ids.add(reset_id)
+
+    def update_visuals(self, step_count):
+        """Refresh floor-zone overlays for operator controls."""
+        if self.zone_overlay is not None:
+            self.zone_overlay.update_zones(self.priority_zones, self.no_go_zones)
+
+
+def room_reached_coverage_goal(
+    cleaning_overlay,
+    room,
+    no_go_zones=None,
+    exclude_entry_blocked=True,
+):
     """Return True when no visible cleaning tiles remain dirty."""
-    return cleaning_overlay.dirty_tile_count(room) == 0
+    return (
+        cleaning_overlay.dirty_tile_count(
+            room,
+            no_go_zones,
+            exclude_entry_blocked,
+        )
+        == 0
+    )
+
+
+def reopen_completed_rooms_with_reachable_dirt(
+    completed_rooms,
+    completed_robot_rooms,
+    cleaning_overlay,
+    no_go_zones=None,
+):
+    """Reopen completed rooms when current no-go zones expose dirty tiles."""
+    reopened_rooms = []
+    for room in sorted(completed_rooms):
+        if room_reached_coverage_goal(cleaning_overlay, room, no_go_zones):
+            continue
+        completed_rooms.discard(room)
+        reopened_rooms.append(room)
+
+    if reopened_rooms:
+        reopened_room_set = set(reopened_rooms)
+        for robot_name, room in list(completed_robot_rooms.items()):
+            if room in reopened_room_set:
+                completed_robot_rooms.pop(robot_name, None)
+
+    return reopened_rooms
 
 
 def cleanup_trigger_reason(
@@ -1397,13 +2444,23 @@ def cleanup_trigger_reason(
     room,
     coverage_done_for_room,
     room_stalled=False,
+    no_go_zones=None,
+    exclude_entry_blocked=True,
 ):
     """Return why a robot should switch from sweep to cleanup, or None."""
-    dirty_count = cleaning_overlay.dirty_tile_count(room)
+    dirty_count = cleaning_overlay.dirty_tile_count(
+        room,
+        no_go_zones,
+        exclude_entry_blocked,
+    )
     if dirty_count <= 0:
         return None
 
-    progress_percent = cleaning_overlay.room_progress_percent(room)
+    progress_percent = cleaning_overlay.room_progress_percent(
+        room,
+        no_go_zones,
+        exclude_entry_blocked,
+    )
     if coverage_done_for_room:
         return f"sweep complete; {dirty_count} dirty tile(s) remain"
     if dirty_count <= FINAL_CLEANUP_DIRTY_TILE_COUNT:
@@ -1416,10 +2473,24 @@ def cleanup_trigger_reason(
     return None
 
 
-def room_progress_snapshot(cleaning_overlay):
+def room_progress_snapshot(
+    cleaning_overlay,
+    no_go_zones=None,
+    exclude_entry_blocked=True,
+    entry_blocked_reachable_rooms=None,
+):
     """Return clean percentages for every room in a stable order."""
+    if entry_blocked_reachable_rooms is None:
+        entry_blocked_reachable_rooms = set()
     return {
-        room: round(cleaning_overlay.room_progress_percent(room), 1)
+        room: round(
+            cleaning_overlay.room_progress_percent(
+                room,
+                no_go_zones,
+                exclude_entry_blocked and room not in entry_blocked_reachable_rooms,
+            ),
+            1,
+        )
         for room in ROOM_TASKS
     }
 
@@ -1432,20 +2503,206 @@ def format_room_progress(snapshot):
     )
 
 
-def room_dirty_tile_count(cleaning_overlay, room):
+def room_dirty_tile_count(
+    cleaning_overlay,
+    room,
+    no_go_zones=None,
+    exclude_entry_blocked=True,
+):
     """Return how many visible dirty tiles remain in one room."""
-    return sum(
-        1 for tile_room, _, _ in getattr(cleaning_overlay, "dirty_tiles", set())
-        if tile_room == room
-    )
+    if hasattr(cleaning_overlay, "dirty_tile_count"):
+        return cleaning_overlay.dirty_tile_count(
+            room,
+            no_go_zones,
+            exclude_entry_blocked,
+        )
+
+    dirty_count = 0
+    for tile_key in getattr(cleaning_overlay, "dirty_tiles", set()):
+        tile_room, _, _ = tile_key
+        if tile_room != room:
+            continue
+        dirty_count += 1
+    return dirty_count
 
 
-def room_dirty_percent(cleaning_overlay, room):
+def room_dirty_percent(
+    cleaning_overlay,
+    room,
+    no_go_zones=None,
+    exclude_entry_blocked=True,
+):
     """Return roughly how much of one room still needs work."""
     total_tiles = cleaning_overlay.room_tile_counts.get(room, 0)
     if total_tiles <= 0:
         return 0.0
-    return 100.0 * room_dirty_tile_count(cleaning_overlay, room) / total_tiles
+    return 100.0 * room_dirty_tile_count(
+        cleaning_overlay,
+        room,
+        no_go_zones,
+        exclude_entry_blocked,
+    ) / total_tiles
+
+
+def pose_for_operator_state(pose):
+    """Return a small pose object for the operator dashboard."""
+    if pose is None:
+        return None
+    return {
+        "x_m": round(float(pose.get("x_m", 0.0)), 3),
+        "y_m": round(float(pose.get("y_m", 0.0)), 3),
+        "theta_rad": round(float(pose.get("theta_rad", 0.0)), 3),
+    }
+
+
+def zone_names_for_room(zones, room):
+    """Return operator zone names that cover a room."""
+    names = []
+    room_bounds = ROOM_TASKS[room]["bounds"]
+    for zone in zones:
+        if zone.get("room") == room or bounds_overlap(zone["bounds"], room_bounds):
+            names.append(zone["name"])
+    return names
+
+
+def build_operator_state(
+    supervisor,
+    step_count,
+    latest_robot_status,
+    room_assignments,
+    cleaning_overlay,
+    operator_controls,
+    operator_paused_robots,
+    completed_rooms,
+    traffic_reservations,
+):
+    """Build the live snapshot consumed by the operator dashboard."""
+    path_summary = traffic_reservations.summary()
+    paused_robots = sorted(operator_paused_robots)
+    robots = []
+
+    for robot_name in EXPECTED_ROBOTS:
+        status = latest_robot_status.get(robot_name)
+        assignment = room_assignments.get(robot_name)
+        actual_pose = get_actual_robot_pose(supervisor, robot_name)
+        reported_pose = status.get("pose") if status is not None else None
+        pose = actual_pose if actual_pose is not None else reported_pose
+        coverage = status.get("coverage", {}) if status is not None else {}
+        route = status.get("assignment_route", {}) if status is not None else {}
+        assigned_room = assignment["room"] if assignment is not None else None
+        display_phase = status.get("phase", "offline") if status is not None else "offline"
+        if robot_name in operator_paused_robots:
+            display_phase = "paused"
+
+        robots.append(
+            {
+                "name": robot_name,
+                "label": robot_name.replace("epuck_", "E"),
+                "connected": status is not None,
+                "paused": robot_name in operator_paused_robots,
+                "phase": display_phase,
+                "reported_phase": status.get("phase", "offline") if status else "offline",
+                "room": assigned_room,
+                "helper": bool(assignment and assignment.get("helper", False)),
+                "pose": pose_for_operator_state(pose),
+                "coverage": {
+                    "room": coverage.get("room"),
+                    "index": int(coverage.get("waypoint_index", 0)),
+                    "count": int(coverage.get("waypoint_count", 0)),
+                    "complete": bool(coverage.get("complete", False)),
+                    "plan_kind": coverage.get("plan_kind", "sweep"),
+                },
+                "route_wait": int(route.get("waiting_steps_remaining", 0)),
+                "target_reached": bool(
+                    status.get("assignment_target_reached", False)
+                    if status is not None
+                    else False
+                ),
+            }
+        )
+
+    rooms = []
+    for room_name, room_config in ROOM_TASKS.items():
+        room_has_inside_robot = assigned_robot_inside_room(
+            supervisor,
+            latest_robot_status,
+            room_assignments,
+            room_name,
+        )
+        exclude_entry_blocked = not room_has_inside_robot
+        assigned_robots = [
+            robot_name.replace("epuck_", "E")
+            for robot_name, assignment in room_assignments.items()
+            if assignment is not None and assignment["room"] == room_name
+        ]
+        rooms.append(
+            {
+                "name": room_name,
+                "bounds": list(room_config["bounds"]),
+                "progress_percent": round(
+                    cleaning_overlay.room_progress_percent(
+                        room_name,
+                        operator_controls.no_go_zones,
+                        exclude_entry_blocked,
+                    ),
+                    1,
+                ),
+                "dirty_tiles": room_dirty_tile_count(
+                    cleaning_overlay,
+                    room_name,
+                    operator_controls.no_go_zones,
+                    exclude_entry_blocked,
+                ),
+                "assigned_robots": assigned_robots,
+                "completed": room_name in completed_rooms,
+                "priority_zones": zone_names_for_room(
+                    operator_controls.priority_zones,
+                    room_name,
+                ),
+                "no_go_zones": zone_names_for_room(
+                    operator_controls.no_go_zones,
+                    room_name,
+                ),
+            }
+        )
+
+    return {
+        "step": step_count,
+        "rooms": rooms,
+        "robots": robots,
+        "operator": {
+            "paused_robots": paused_robots,
+            "priority_zones": operator_controls.priority_zones,
+            "no_go_zones": operator_controls.no_go_zones,
+            "pending_redirects": operator_controls.pending_redirects(),
+            "sim_reset_request": operator_controls.pending_sim_reset_request(),
+            "last_error": operator_controls.last_error,
+        },
+        "traffic": {
+            "planned_distance_m": round(path_summary["planned_distance_m"], 2),
+            "waiting_steps": path_summary["waiting_steps"],
+            "doorway_conflicts": path_summary["doorway_conflicts"],
+        },
+    }
+
+
+def write_operator_state_file(state_path, operator_state):
+    """Write the live dashboard state with a small atomic replace."""
+    path = Path(state_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    temp_path.write_text(json.dumps(operator_state, indent=2) + "\n", encoding="utf-8")
+    temp_path.replace(path)
+
+
+def reset_operator_state_file(state_path):
+    """Clear the dashboard map state after a Webots reset."""
+    try:
+        write_operator_state_file(state_path, default_operator_state_snapshot())
+    except OSError as exc:
+        print(f"[supervisor] Could not reset operator state: {exc}")
+        return False
+    return True
 
 
 def room_progress_rate(progress_monitors, room):
@@ -1463,14 +2720,21 @@ def room_progress_rate(progress_monitors, room):
     return 0.0
 
 
-def route_cost_to_room(robot_status, room):
+def route_cost_to_room(robot_status, room, no_go_zones=None):
     """Return planned route distance from one robot status to a room."""
     if not isinstance(robot_status, dict):
         return float("inf")
     pose = robot_status.get("pose")
     if pose is None:
         return float("inf")
-    route = generate_assignment_route(pose, room)
+    base_route = generate_assignment_route(pose, room)
+    route = route_around_no_go_zones(
+        base_route,
+        no_go_zones,
+        start_point=pose_point(pose),
+    )
+    if not route_reaches_final_waypoint(base_route, route):
+        return float("inf")
     return route_distance_m(pose, route)
 
 
@@ -1665,12 +2929,28 @@ def rooms_ready_for_progress_monitoring(supervisor, latest_robot_status, room_as
     return ready_rooms
 
 
+def assigned_robot_inside_room(supervisor, latest_robot_status, room_assignments, room):
+    """Return True when an assigned robot is already inside one room."""
+    for robot_name, assignment in room_assignments.items():
+        if assignment is None or assignment["room"] != room:
+            continue
+
+        status = latest_robot_status.get(robot_name)
+        pose = get_actual_robot_pose(supervisor, robot_name)
+        if pose is None and isinstance(status, dict):
+            pose = status.get("pose")
+        if room_for_pose(pose) == room:
+            return True
+    return False
+
+
 def select_robot_for_stalled_room(
     stalled_room,
     room_assignments,
     cleaning_overlay,
     excluded_robots=None,
     latest_robot_status=None,
+    no_go_zones=None,
 ):
     """Pick a robot that can be redirected to a stalled room without abandoning work."""
     if excluded_robots is None:
@@ -1683,10 +2963,14 @@ def select_robot_for_stalled_room(
         if robot_name in excluded_robots:
             continue
         if room_assignments.get(robot_name) is None:
-            idle_candidates.append((
-                route_cost_to_room(latest_robot_status.get(robot_name), stalled_room),
-                robot_name,
-            ))
+            route_distance = route_cost_to_room(
+                latest_robot_status.get(robot_name),
+                stalled_room,
+                no_go_zones,
+            )
+            if no_go_zones and math.isinf(route_distance):
+                continue
+            idle_candidates.append((route_distance, robot_name))
     if idle_candidates:
         idle_candidates.sort()
         return idle_candidates[0][1]
@@ -1707,7 +2991,10 @@ def select_robot_for_stalled_room(
             continue
 
         source_room = assignment["room"]
-        source_progress = cleaning_overlay.room_progress_percent(source_room)
+        source_progress = cleaning_overlay.room_progress_percent(
+            source_room,
+            no_go_zones,
+        )
         source_count = active_room_counts.get(source_room, 0)
         source_target_count = target_robot_count_for_room(source_room)
         if source_count <= source_target_count:
@@ -1716,7 +3003,10 @@ def select_robot_for_stalled_room(
         route_distance_m = route_cost_to_room(
             latest_robot_status.get(robot_name),
             stalled_room,
+            no_go_zones,
         )
+        if no_go_zones and math.isinf(route_distance_m):
+            continue
         candidate = (route_distance_m, -source_progress, robot_name)
         if assignment.get("helper", False):
             helper_candidates.append(candidate)
@@ -1757,6 +3047,7 @@ def unfinished_rooms_below_target(
     completed_rooms,
     cleaning_overlay,
     ignored_robot=None,
+    no_go_zones=None,
 ):
     """Return unfinished rooms that have fewer robots than their normal target."""
     active_room_counts = {}
@@ -1770,7 +3061,7 @@ def unfinished_rooms_below_target(
     for room in ROOM_TASKS:
         if room in completed_rooms:
             continue
-        progress_percent = cleaning_overlay.room_progress_percent(room)
+        progress_percent = cleaning_overlay.room_progress_percent(room, no_go_zones)
         if progress_percent >= COVERAGE_COMPLETE_PERCENT:
             continue
         active_count = active_room_counts.get(room, 0)
@@ -1798,6 +3089,8 @@ def select_reassignment_room(
     cleaning_overlay,
     latest_robot_status=None,
     progress_monitors=None,
+    priority_zones=None,
+    no_go_zones=None,
 ):
     """
     Pick the unfinished room that most needs help.
@@ -1827,13 +3120,28 @@ def select_reassignment_room(
         completed_rooms,
         cleaning_overlay,
         ignored_robot=robot_name,
+        no_go_zones=no_go_zones,
     )
-    preferred_rooms = [room for room in preferred_rooms if room != current_room]
+    preferred_rooms = [
+        room
+        for room in preferred_rooms
+        if room != current_room
+        and (
+            not no_go_zones
+            or not math.isinf(
+                route_cost_to_room(
+                    latest_robot_status.get(robot_name),
+                    room,
+                    no_go_zones,
+                )
+            )
+        )
+    ]
     candidate_rooms = []
     for room in ROOM_TASKS:
         if room == current_room or room in completed_rooms:
             continue
-        progress_percent = cleaning_overlay.room_progress_percent(room)
+        progress_percent = cleaning_overlay.room_progress_percent(room, no_go_zones)
         if progress_percent >= COVERAGE_COMPLETE_PERCENT:
             continue
         if preferred_rooms and room not in preferred_rooms:
@@ -1842,17 +3150,26 @@ def select_reassignment_room(
         active_count = active_room_counts.get(room, 0)
         support_ratio = active_count / target_count
         progress_rate = room_progress_rate(progress_monitors, room)
-        route_distance = route_cost_to_room(latest_robot_status.get(robot_name), room)
-        dirty_percent = room_dirty_percent(cleaning_overlay, room)
+        route_distance = route_cost_to_room(
+            latest_robot_status.get(robot_name),
+            room,
+            no_go_zones,
+        )
+        if no_go_zones and math.isinf(route_distance):
+            continue
+        dirty_percent = room_dirty_percent(cleaning_overlay, room, no_go_zones)
+        priority_weight = priority_weight_for_room(priority_zones, room)
         score = (
             support_ratio
             + MRTA_PROGRESS_RATE_WEIGHT * progress_rate
             + MRTA_ROUTE_DISTANCE_WEIGHT * route_distance
             - MRTA_DIRTY_PERCENT_WEIGHT * dirty_percent
+            - OPERATOR_PRIORITY_ROUTE_WEIGHT * priority_weight
         )
         candidate_rooms.append((
             support_ratio,
             score,
+            -priority_weight,
             progress_rate,
             progress_percent,
             route_distance,
@@ -1863,7 +3180,7 @@ def select_reassignment_room(
         return None
 
     candidate_rooms.sort()
-    return candidate_rooms[0][5]
+    return candidate_rooms[0][6]
 
 
 def select_stuck_recovery_room(
@@ -1874,6 +3191,9 @@ def select_stuck_recovery_room(
     latest_robot_status=None,
     progress_monitors=None,
     recovery_count=0,
+    priority_zones=None,
+    no_go_zones=None,
+    robot_inside_room=False,
 ):
     """Choose whether a stuck robot should retry its room or help elsewhere."""
     assignment = room_assignments.get(robot_name)
@@ -1883,7 +3203,12 @@ def select_stuck_recovery_room(
     room = assignment["room"]
     room_unfinished = (
         room not in completed_rooms
-        and not room_reached_coverage_goal(cleaning_overlay, room)
+        and not room_reached_coverage_goal(
+            cleaning_overlay,
+            room,
+            no_go_zones,
+            exclude_entry_blocked=not robot_inside_room,
+        )
     )
     if (
         room_unfinished
@@ -1901,6 +3226,8 @@ def select_stuck_recovery_room(
         cleaning_overlay,
         latest_robot_status,
         progress_monitors,
+        priority_zones,
+        no_go_zones,
     )
     if fallback_room is not None:
         return fallback_room
@@ -1932,6 +3259,7 @@ def prepare_assignment_for_dispatch(
     room_assignments=None,
     traffic_reservations=None,
     step_count=0,
+    no_go_zones=None,
 ):
     """Refresh route, lane, delay, and metric fields before sending a task."""
     lane_index = 0
@@ -1942,31 +3270,65 @@ def prepare_assignment_for_dispatch(
             room_assignments,
         )
 
+    pose = None
+    if isinstance(robot_status, dict):
+        pose = robot_status.get("pose")
+
     coverage_plan = generate_coverage_waypoints(
         assignment["room"],
         lane_index,
         lane_count,
     )
+    entry_blocked = room_entry_blocked_by_no_go_zones(
+        assignment["room"],
+        no_go_zones,
+    )
+    if entry_blocked:
+        coverage_plan = []
+    else:
+        coverage_plan = coverage_plan_around_no_go_zones(
+            coverage_plan,
+            no_go_zones,
+        )
+    coverage_available = bool(coverage_plan)
     route_target = (
         coverage_plan[0]
-        if coverage_plan
-        else [
-            round(ROOM_TASKS[assignment["room"]]["center"][0], 3),
-            round(ROOM_TASKS[assignment["room"]]["center"][1], 3),
-        ]
+        if coverage_available
+        else route_target_for_empty_coverage(
+            assignment["room"],
+            no_go_zones,
+            pose,
+        )
     )
-
-    pose = None
-    if isinstance(robot_status, dict):
-        pose = robot_status.get("pose")
 
     route = assignment.get("route", [assignment["target"]])
     if pose is not None:
-        route = generate_assignment_route(
-            pose,
-            assignment["room"],
-            final_waypoint=route_target,
-        )
+        if coverage_available:
+            route = generate_assignment_route(
+                pose,
+                assignment["room"],
+                final_waypoint=route_target,
+            )
+        else:
+            route = generate_route_to_room_hub(
+                pose,
+                assignment["room"],
+                final_waypoint=route_target,
+            )
+    route = route_around_no_go_zones(
+        route,
+        no_go_zones,
+        start_point=pose_point(pose),
+    )
+    if (
+        no_go_zones
+        and pose is not None
+        and route_target is not None
+        and (not route or route[-1] != route_target)
+    ):
+        coverage_plan = []
+        route_target = route[-1] if route else pose_point(pose)
+        route = [route_target] if route_target is not None and not route else route
 
     planned_distance_m = route_distance_m(pose, route)
     resources = traffic_resource_keys(pose, assignment["room"])
@@ -1997,6 +3359,10 @@ def prepare_assignment_for_dispatch(
         "doorway_conflicts": reservation["doorway_conflicts"],
         "resources": reservation["reserved_resources"],
         "conflict_resources": reservation["conflict_resources"],
+        "operator_no_go_zones": [
+            zone["name"]
+            for zone in (no_go_zones or [])
+        ],
     }
     return coverage_plan
 
@@ -2010,6 +3376,7 @@ def send_assignment_commands(
     robot_status=None,
     traffic_reservations=None,
     step_count=0,
+    no_go_zones=None,
 ):
     """Send the room target and coverage path to one robot."""
     coverage_plan = prepare_assignment_for_dispatch(
@@ -2019,6 +3386,7 @@ def send_assignment_commands(
         room_assignments,
         traffic_reservations,
         step_count,
+        no_go_zones,
     )
     emitter.send(
         json.dumps(
@@ -2083,6 +3451,8 @@ def send_room_coverage_plans(
     cleaning_overlay=None,
     cleanup_plan_signatures=None,
     cleanup_plan_steps=None,
+    no_go_zones=None,
+    latest_robot_status=None,
 ):
     """Resend split sweep lanes to every robot currently assigned to one room."""
     coverage_plans = {}
@@ -2092,6 +3462,22 @@ def send_room_coverage_plans(
             room_assignments,
         )
         coverage_plan = generate_coverage_waypoints(room, lane_index, lane_count)
+        status = (
+            latest_robot_status.get(robot_name)
+            if isinstance(latest_robot_status, dict)
+            else None
+        )
+        pose = status.get("pose") if isinstance(status, dict) else None
+        robot_inside_room = pose is not None and room_for_pose(pose) == room
+        start_point = pose_point(pose) if robot_inside_room else None
+        if room_entry_blocked_by_no_go_zones(room, no_go_zones) and not robot_inside_room:
+            coverage_plan = []
+        else:
+            coverage_plan = coverage_plan_around_no_go_zones(
+                coverage_plan,
+                no_go_zones,
+                start_point=start_point,
+            )
         if cleanup_plan_signatures is not None:
             cleanup_plan_signatures.pop(robot_name, None)
         if cleanup_plan_steps is not None:
@@ -2125,6 +3511,131 @@ def send_recovery_command(emitter, robot_name, reason):
     )
 
 
+def assign_idle_robots_to_unfinished_rooms(
+    emitter,
+    room_assignments,
+    completed_rooms,
+    cleaning_overlay,
+    latest_robot_status,
+    operator_paused_robots,
+    coverage_plans,
+    cleanup_plan_signatures,
+    cleanup_plan_steps,
+    last_cleaning_poses,
+    robot_recovery_counts,
+    traffic_reservations=None,
+    step_count=0,
+    priority_zones=None,
+    no_go_zones=None,
+):
+    """Send idle robots back to rooms that became unfinished again."""
+    assigned_rooms = {}
+    for robot_name in EXPECTED_ROBOTS:
+        if robot_name in operator_paused_robots:
+            continue
+        if room_assignments.get(robot_name) is not None:
+            continue
+
+        status = latest_robot_status.get(robot_name)
+        if status is None:
+            continue
+
+        next_room = select_reassignment_room(
+            robot_name,
+            room_assignments,
+            completed_rooms,
+            cleaning_overlay,
+            latest_robot_status,
+            priority_zones=priority_zones,
+            no_go_zones=no_go_zones,
+        )
+        if next_room is None:
+            continue
+
+        next_assignment = build_assignment(status, next_room, helper=True)
+        room_assignments[robot_name] = next_assignment
+        cleanup_plan_signatures.pop(robot_name, None)
+        cleanup_plan_steps.pop(robot_name, None)
+        cleaning_overlay.release_robot_claims(robot_name)
+        last_cleaning_poses.pop(robot_name, None)
+        robot_recovery_counts.pop(robot_name, None)
+        cleaning_overlay.show_dirty_room(next_room)
+        send_assignment_commands(
+            emitter,
+            robot_name,
+            next_assignment,
+            room_assignments,
+            send_coverage=False,
+            robot_status=status,
+            traffic_reservations=traffic_reservations,
+            step_count=step_count,
+            no_go_zones=no_go_zones,
+        )
+        coverage_plans.update(
+            send_room_coverage_plans(
+                emitter,
+                room_assignments,
+                next_room,
+                cleaning_overlay,
+                cleanup_plan_signatures,
+                cleanup_plan_steps,
+                no_go_zones,
+                latest_robot_status,
+            )
+        )
+        assigned_rooms[robot_name] = next_room
+
+    return assigned_rooms
+
+
+def handle_operator_no_go_change(
+    emitter,
+    room_assignments,
+    completed_rooms,
+    completed_robot_rooms,
+    cleaning_overlay,
+    latest_robot_status,
+    operator_paused_robots,
+    coverage_plans,
+    cleanup_plan_signatures,
+    cleanup_plan_steps,
+    last_cleaning_poses,
+    robot_recovery_counts,
+    traffic_reservations=None,
+    step_count=0,
+    priority_zones=None,
+    no_go_zones=None,
+):
+    """Refresh reachable work after the operator changes no-go zones."""
+    reopened_rooms = reopen_completed_rooms_with_reachable_dirt(
+        completed_rooms,
+        completed_robot_rooms,
+        cleaning_overlay,
+        no_go_zones,
+    )
+    for room in reopened_rooms:
+        cleaning_overlay.show_dirty_room(room)
+
+    assigned_idle_rooms = assign_idle_robots_to_unfinished_rooms(
+        emitter,
+        room_assignments,
+        completed_rooms,
+        cleaning_overlay,
+        latest_robot_status,
+        operator_paused_robots,
+        coverage_plans,
+        cleanup_plan_signatures,
+        cleanup_plan_steps,
+        last_cleaning_poses,
+        robot_recovery_counts,
+        traffic_reservations,
+        step_count,
+        priority_zones,
+        no_go_zones,
+    )
+    return reopened_rooms, assigned_idle_rooms
+
+
 def send_cleanup_plan_if_needed(
     emitter,
     cleaning_overlay,
@@ -2135,14 +3646,39 @@ def send_cleanup_plan_if_needed(
     cleanup_plan_steps,
     step_count,
     reason,
+    no_go_zones=None,
+    entry_blocked_is_reachable=False,
 ):
     """Send a cleanup pass when the robot has new or stale dirty-tile targets."""
-    cleanup_plan = cleaning_overlay.claim_dirty_tile_centers(
+    claimed_cleanup_plan = cleaning_overlay.claim_dirty_tile_centers(
         room,
         robot_name,
         pose,
         prefer_edges=True,
+        no_go_zones=no_go_zones,
+        entry_blocked_is_reachable=entry_blocked_is_reachable,
     )
+    cleanup_plan = coverage_plan_around_no_go_zones(
+        claimed_cleanup_plan,
+        no_go_zones,
+        start_point=pose_point(pose),
+    )
+    if claimed_cleanup_plan:
+        cleanup_waypoint_keys = {
+            tuple(round(float(coordinate), 3) for coordinate in waypoint)
+            for waypoint in cleanup_plan
+            if isinstance(waypoint, (list, tuple)) and len(waypoint) == 2
+        }
+        reachable_claim_centers = [
+            center for center in claimed_cleanup_plan
+            if tuple(round(float(coordinate), 3) for coordinate in center)
+            in cleanup_waypoint_keys
+        ]
+        cleaning_overlay.release_robot_room_claims_except_centers(
+            robot_name,
+            room,
+            reachable_claim_centers,
+        )
     if not cleanup_plan:
         return None
 
@@ -2193,8 +3729,14 @@ def run():
     receiver.enable(timestep)
     emitter = supervisor.getDevice("emitter")
 
+    repo_root = Path(__file__).resolve().parents[2]
+    operator_control_path = repo_root / OPERATOR_CONTROL_FILE
+    reset_operator_control_file(operator_control_path)
+
     global_grid = GlobalOccupancyGrid(world_size_m=6.0, cell_size_m=0.05)
     cleaning_overlay = CleaningOverlay(supervisor, ROOM_TASKS)
+    operator_controls = OperatorControls(supervisor, operator_control_path)
+    operator_state_path = repo_root / OPERATOR_STATE_FILE
     task_allocator = TaskAllocator(
         rooms=ROOM_TASKS,
         distance_weight=MRTA_DISTANCE_WEIGHT,
@@ -2212,10 +3754,49 @@ def run():
     last_scan_match_log_steps = {}
     last_map_update_log_steps = {}
     traffic_reservations = TrafficReservationBook()
+    operator_paused_robots = set()
+    operator_paused_assignments = {}
+    last_operator_no_go_signature = operator_zone_signature(operator_controls.no_go_zones)
+    last_operator_state_error_step = -COMMUNICATION_SUMMARY_INTERVAL_STEPS
+    last_webots_time_s = supervisor.getTime()
     completed_rooms = set()
     completed_robot_rooms = {}
     assignments_sent = False
     step_count = 0
+    reset_operator_state_file(operator_state_path)
+
+    def clear_runtime_after_sim_reset():
+        """Clear supervisor memory that should not survive a sim reset."""
+        nonlocal global_grid, traffic_reservations, assignments_sent
+        nonlocal last_operator_no_go_signature
+
+        global_grid = GlobalOccupancyGrid(world_size_m=6.0, cell_size_m=0.05)
+        latest_robot_status.clear()
+        last_cleaning_poses.clear()
+        room_assignments.clear()
+        coverage_plans.clear()
+        cleanup_plan_signatures.clear()
+        cleanup_plan_steps.clear()
+        robot_motion_monitors.clear()
+        robot_recovery_counts.clear()
+        room_progress_monitors.clear()
+        last_scan_match_log_steps.clear()
+        last_map_update_log_steps.clear()
+        traffic_reservations = TrafficReservationBook()
+        operator_paused_robots.clear()
+        operator_paused_assignments.clear()
+        completed_rooms.clear()
+        completed_robot_rooms.clear()
+        assignments_sent = False
+        last_operator_no_go_signature = operator_zone_signature(
+            operator_controls.no_go_zones
+        )
+        try:
+            cleaning_overlay.reset_progress()
+        except Exception as exc:
+            print(f"[supervisor] Could not reset cleaning overlay: {exc}")
+        reset_operator_state_file(operator_state_path)
+
     print("[supervisor] Starting central communication hub")
     print(
         f"[supervisor] Global map ready: "
@@ -2224,6 +3805,39 @@ def run():
 
     while supervisor.step(timestep) != -1:
         step_count += 1
+        webots_time_s = supervisor.getTime()
+        if webots_time_s + 1e-9 < last_webots_time_s:
+            print(
+                "[supervisor] Webots simulation reset detected; "
+                "clearing operator controls"
+            )
+            reset_operator_control_file(operator_controls.control_path)
+            operator_controls.last_mtime_ns = None
+            operator_controls.load(step_count)
+            operator_controls.update_visuals(step_count)
+            clear_runtime_after_sim_reset()
+        last_webots_time_s = webots_time_s
+
+        operator_controls.load_if_due(step_count)
+        sim_reset_request = operator_controls.pending_sim_reset_request()
+        if sim_reset_request is not None:
+            reset_id = sim_reset_request["id"]
+            print(f"[supervisor] Dashboard requested simulation reset: {reset_id}")
+            operator_controls.mark_sim_reset_processed(reset_id)
+            reset_operator_control_file(operator_controls.control_path)
+            operator_controls.last_mtime_ns = None
+            operator_controls.load(step_count)
+            operator_controls.update_visuals(step_count)
+            clear_runtime_after_sim_reset()
+            supervisor.simulationReset()
+            continue
+
+        operator_no_go_signature = operator_zone_signature(operator_controls.no_go_zones)
+        operator_no_go_changed = (
+            operator_no_go_signature != last_operator_no_go_signature
+        )
+        last_operator_no_go_signature = operator_no_go_signature
+        operator_controls.update_visuals(step_count)
 
         while receiver.getQueueLength() > 0:
             raw_message = receiver.getString()
@@ -2287,7 +3901,9 @@ def run():
             if pose is None:
                 pose = message["pose"]
 
-            if assignment is not None and robot_can_mark_cleaning(pose, assignment["room"]):
+            if robot_name in operator_paused_robots:
+                last_cleaning_poses.pop(robot_name, None)
+            elif assignment is not None and robot_can_mark_cleaning(pose, assignment["room"]):
                 cleaned_count = cleaning_overlay.mark_clean_trail(
                     assignment["room"],
                     last_cleaning_poses.get(robot_name),
@@ -2296,7 +3912,8 @@ def run():
                 if cleaned_count:
                     robot_recovery_counts.pop(robot_name, None)
                     room_progress = cleaning_overlay.room_progress_percent(
-                        assignment["room"]
+                        assignment["room"],
+                        operator_controls.no_go_zones,
                     )
                     print(
                         f"[supervisor] Cleaned {cleaned_count} tile(s) in "
@@ -2333,7 +3950,11 @@ def run():
             )
         )
         if ready_for_assignment:
-            room_assignments = task_allocator.assign(latest_robot_status)
+            room_assignments = task_allocator.assign(
+                latest_robot_status,
+                no_go_zones=operator_controls.no_go_zones,
+                priority_zones=operator_controls.priority_zones,
+            )
             if room_assignments:
                 for robot_name, assignment in room_assignments.items():
                     cleaning_overlay.show_dirty_room(assignment["room"])
@@ -2345,6 +3966,7 @@ def run():
                         robot_status=latest_robot_status.get(robot_name),
                         traffic_reservations=traffic_reservations,
                         step_count=step_count,
+                        no_go_zones=operator_controls.no_go_zones,
                     )
                     print(
                         f"[supervisor] Assigned {robot_name} -> "
@@ -2356,10 +3978,238 @@ def run():
                 assignments_sent = True
 
         if assignments_sent:
+            if operator_no_go_changed:
+                reopened_rooms, assigned_idle_rooms = handle_operator_no_go_change(
+                    emitter,
+                    room_assignments,
+                    completed_rooms,
+                    completed_robot_rooms,
+                    cleaning_overlay,
+                    latest_robot_status,
+                    operator_paused_robots,
+                    coverage_plans,
+                    cleanup_plan_signatures,
+                    cleanup_plan_steps,
+                    last_cleaning_poses,
+                    robot_recovery_counts,
+                    traffic_reservations,
+                    step_count,
+                    operator_controls.priority_zones,
+                    operator_controls.no_go_zones,
+                )
+                if reopened_rooms:
+                    print(
+                        "[supervisor] Reopened room(s) after operator no-go change: "
+                        + ", ".join(reopened_rooms)
+                    )
+                for robot_name, room in assigned_idle_rooms.items():
+                    room_source = "reopened" if room in reopened_rooms else "available"
+                    print(
+                        f"[supervisor] Reassigned idle {robot_name} "
+                        f"to {room_source} {room}"
+                    )
+                for robot_name, assignment in room_assignments.items():
+                    if robot_name in operator_paused_robots or assignment is None:
+                        continue
+                    status = latest_robot_status.get(robot_name)
+                    if status is None or status.get("assignment_target_reached", False):
+                        continue
+                    send_assignment_commands(
+                        emitter,
+                        robot_name,
+                        assignment,
+                        room_assignments,
+                        send_coverage=False,
+                        robot_status=status,
+                        traffic_reservations=traffic_reservations,
+                        step_count=step_count,
+                        no_go_zones=operator_controls.no_go_zones,
+                    )
+                refreshed_rooms = sorted(
+                    {
+                        assignment["room"]
+                        for robot_name, assignment in room_assignments.items()
+                        if (
+                            robot_name not in operator_paused_robots
+                            and assignment is not None
+                        )
+                    }
+                )
+                for room in refreshed_rooms:
+                    coverage_plans.update(
+                        send_room_coverage_plans(
+                            emitter,
+                            room_assignments,
+                            room,
+                            cleaning_overlay,
+                            cleanup_plan_signatures,
+                            cleanup_plan_steps,
+                            operator_controls.no_go_zones,
+                            latest_robot_status,
+                        )
+                    )
+                print("[supervisor] Refreshed active routes and sweeps for operator no-go zone changes")
+
+            for redirect in operator_controls.pending_redirects():
+                robot_name = redirect["robot"]
+                next_room = redirect["room"]
+                status = latest_robot_status.get(robot_name)
+                if status is None:
+                    continue
+
+                robot_is_paused = robot_name in operator_paused_robots
+                if robot_is_paused:
+                    previous_assignment = operator_paused_assignments.get(robot_name)
+                else:
+                    previous_assignment = room_assignments.get(robot_name)
+                previous_room = None
+                if previous_assignment is not None:
+                    previous_room = previous_assignment["room"]
+
+                cleaning_overlay.release_robot_claims(robot_name)
+                cleanup_plan_signatures.pop(robot_name, None)
+                cleanup_plan_steps.pop(robot_name, None)
+                last_cleaning_poses.pop(robot_name, None)
+                completed_robot_rooms.pop(robot_name, None)
+                robot_recovery_counts.pop(robot_name, None)
+                robot_motion_monitors.pop(robot_name, None)
+                if cleaning_overlay.dirty_tile_count(
+                    next_room,
+                    operator_controls.no_go_zones,
+                ) > 0:
+                    completed_rooms.discard(next_room)
+
+                next_assignment = build_assignment(status, next_room, helper=True)
+                if robot_is_paused:
+                    operator_paused_assignments[robot_name] = next_assignment
+                    room_assignments.pop(robot_name, None)
+                    coverage_plans.pop(robot_name, None)
+                    cleaning_overlay.show_dirty_room(next_room)
+                    operator_controls.mark_redirect_processed(redirect["id"])
+                    print(
+                        f"[supervisor] Operator queued paused {robot_name} "
+                        f"from {previous_room or 'idle'} to {next_room}"
+                    )
+                    continue
+
+                room_assignments[robot_name] = next_assignment
+                cleaning_overlay.show_dirty_room(next_room)
+                send_assignment_commands(
+                    emitter,
+                    robot_name,
+                    next_assignment,
+                    room_assignments,
+                    send_coverage=False,
+                    robot_status=status,
+                    traffic_reservations=traffic_reservations,
+                    step_count=step_count,
+                    no_go_zones=operator_controls.no_go_zones,
+                )
+                coverage_plans.update(
+                    send_room_coverage_plans(
+                        emitter,
+                        room_assignments,
+                        next_room,
+                        cleaning_overlay,
+                        cleanup_plan_signatures,
+                        cleanup_plan_steps,
+                        operator_controls.no_go_zones,
+                        latest_robot_status,
+                    )
+                )
+                if previous_room is not None and previous_room != next_room:
+                    coverage_plans.update(
+                        send_room_coverage_plans(
+                            emitter,
+                            room_assignments,
+                            previous_room,
+                            cleaning_overlay,
+                            cleanup_plan_signatures,
+                            cleanup_plan_steps,
+                            operator_controls.no_go_zones,
+                            latest_robot_status,
+                        )
+                    )
+
+                operator_controls.mark_redirect_processed(redirect["id"])
+                print(
+                    f"[supervisor] Operator redirected {robot_name} "
+                    f"from {previous_room or 'idle'} to {next_room}"
+                )
+
+            requested_paused_robots = operator_controls.paused_robot_names()
+            for robot_name in EXPECTED_ROBOTS:
+                if (
+                    robot_name in requested_paused_robots
+                    and robot_name not in operator_paused_robots
+                ):
+                    send_idle_command(emitter, robot_name)
+                    operator_paused_robots.add(robot_name)
+                    pause_robot_assignment(
+                        robot_name,
+                        room_assignments,
+                        operator_paused_assignments,
+                    )
+                    coverage_plans.pop(robot_name, None)
+                    robot_motion_monitors.pop(robot_name, None)
+                    cleanup_plan_signatures.pop(robot_name, None)
+                    cleanup_plan_steps.pop(robot_name, None)
+                    cleaning_overlay.release_robot_claims(robot_name)
+                    last_cleaning_poses.pop(robot_name, None)
+                    print(f"[supervisor] Operator paused {robot_name}")
+                elif (
+                    robot_name not in requested_paused_robots
+                    and robot_name in operator_paused_robots
+                ):
+                    operator_paused_robots.remove(robot_name)
+                    assignment = resume_robot_assignment(
+                        robot_name,
+                        room_assignments,
+                        operator_paused_assignments,
+                    )
+                    status = latest_robot_status.get(robot_name)
+                    if assignment is None or status is None:
+                        print(f"[supervisor] Operator resumed {robot_name}; no task queued")
+                        continue
+
+                    cleaning_overlay.show_dirty_room(assignment["room"])
+                    send_assignment_commands(
+                        emitter,
+                        robot_name,
+                        assignment,
+                        room_assignments,
+                        send_coverage=False,
+                        robot_status=status,
+                        traffic_reservations=traffic_reservations,
+                        step_count=step_count,
+                        no_go_zones=operator_controls.no_go_zones,
+                    )
+                    coverage_plans.update(
+                        send_room_coverage_plans(
+                            emitter,
+                            room_assignments,
+                            assignment["room"],
+                            cleaning_overlay,
+                            cleanup_plan_signatures,
+                            cleanup_plan_steps,
+                            operator_controls.no_go_zones,
+                            latest_robot_status,
+                        )
+                    )
+                    robot_motion_monitors.pop(robot_name, None)
+                    print(
+                        f"[supervisor] Operator resumed {robot_name} "
+                        f"toward {assignment['room']}"
+                    )
+
             for robot_name in EXPECTED_ROBOTS:
                 status = latest_robot_status.get(robot_name)
                 assignment = room_assignments.get(robot_name)
-                if status is None or assignment is None:
+                if (
+                    robot_name in operator_paused_robots
+                    or status is None
+                    or assignment is None
+                ):
                     continue
 
                 pose = get_actual_robot_pose(supervisor, robot_name)
@@ -2387,6 +4237,9 @@ def run():
                     latest_robot_status,
                     room_progress_monitors,
                     recovery_count,
+                    operator_controls.priority_zones,
+                    operator_controls.no_go_zones,
+                    robot_inside_room=room_for_pose(pose) == room,
                 )
                 if next_room is None:
                     continue
@@ -2410,6 +4263,7 @@ def run():
                     robot_status=status,
                     traffic_reservations=traffic_reservations,
                     step_count=step_count,
+                    no_go_zones=operator_controls.no_go_zones,
                 )
                 coverage_plans.update(
                     send_room_coverage_plans(
@@ -2419,6 +4273,8 @@ def run():
                         cleaning_overlay,
                         cleanup_plan_signatures,
                         cleanup_plan_steps,
+                        operator_controls.no_go_zones,
+                        latest_robot_status,
                     )
                 )
                 if room != next_room:
@@ -2431,6 +4287,8 @@ def run():
                             cleaning_overlay,
                             cleanup_plan_signatures,
                             cleanup_plan_steps,
+                            operator_controls.no_go_zones,
+                            latest_robot_status,
                         )
                     )
                 robot_motion_monitors.pop(robot_name, None)
@@ -2441,18 +4299,38 @@ def run():
                     f"(recovery_attempt={recovery_count})"
                 )
 
-            progress_snapshot = room_progress_snapshot(cleaning_overlay)
+            monitored_room_assignments = {
+                robot_name: assignment
+                for robot_name, assignment in room_assignments.items()
+                if robot_name not in operator_paused_robots
+            }
+            progress_ready_rooms = rooms_ready_for_progress_monitoring(
+                supervisor,
+                latest_robot_status,
+                monitored_room_assignments,
+            )
+            entry_blocked_reachable_rooms = {
+                room
+                for room in ROOM_TASKS
+                if assigned_robot_inside_room(
+                    supervisor,
+                    latest_robot_status,
+                    monitored_room_assignments,
+                    room,
+                )
+            }
+            progress_snapshot = room_progress_snapshot(
+                cleaning_overlay,
+                operator_controls.no_go_zones,
+                entry_blocked_reachable_rooms=entry_blocked_reachable_rooms,
+            )
             stalled_rooms = update_room_progress_monitors(
                 room_progress_monitors,
                 progress_snapshot,
-                room_assignments,
+                monitored_room_assignments,
                 completed_rooms,
                 step_count,
-                rooms_ready_for_progress_monitoring(
-                    supervisor,
-                    latest_robot_status,
-                    room_assignments,
-                ),
+                progress_ready_rooms,
             )
             stalled_room_set = set(stalled_rooms)
             redirected_robots = set()
@@ -2468,8 +4346,9 @@ def run():
                     redirect_room,
                     room_assignments,
                     cleaning_overlay,
-                    excluded_robots=redirected_robots,
+                    excluded_robots=redirected_robots | operator_paused_robots,
                     latest_robot_status=latest_robot_status,
+                    no_go_zones=operator_controls.no_go_zones,
                 )
                 if robot_to_redirect is None:
                     print(
@@ -2510,6 +4389,7 @@ def run():
                     robot_status=status,
                     traffic_reservations=traffic_reservations,
                     step_count=step_count,
+                    no_go_zones=operator_controls.no_go_zones,
                 )
                 coverage_plans.update(
                     send_room_coverage_plans(
@@ -2519,6 +4399,8 @@ def run():
                         cleaning_overlay,
                         cleanup_plan_signatures,
                         cleanup_plan_steps,
+                        operator_controls.no_go_zones,
+                        latest_robot_status,
                     )
                 )
                 if previous_room != "idle" and previous_room != redirect_room:
@@ -2530,6 +4412,8 @@ def run():
                             cleaning_overlay,
                             cleanup_plan_signatures,
                             cleanup_plan_steps,
+                            operator_controls.no_go_zones,
+                            latest_robot_status,
                         )
                     )
                 robot_motion_monitors.pop(robot_to_redirect, None)
@@ -2543,25 +4427,38 @@ def run():
             for robot_name in EXPECTED_ROBOTS:
                 status = latest_robot_status.get(robot_name)
                 assignment = room_assignments.get(robot_name)
-                if status is None or assignment is None:
+                if (
+                    robot_name in operator_paused_robots
+                    or status is None
+                    or assignment is None
+                ):
                     continue
 
                 room = assignment["room"]
+                pose = get_actual_robot_pose(supervisor, robot_name)
+                if pose is None:
+                    pose = status["pose"]
+                robot_inside_room = room_for_pose(pose) == room
                 coverage = status.get("coverage", {})
                 coverage_done_for_room = (
                     coverage.get("room") == room
                     and coverage.get("complete", False)
+                )
+                room_has_inside_robot = assigned_robot_inside_room(
+                    supervisor,
+                    latest_robot_status,
+                    room_assignments,
+                    room,
                 )
                 cleanup_reason = cleanup_trigger_reason(
                     cleaning_overlay,
                     room,
                     coverage_done_for_room,
                     room in stalled_room_set,
+                    operator_controls.no_go_zones,
+                    exclude_entry_blocked=not room_has_inside_robot,
                 )
                 if cleanup_reason is not None:
-                    pose = get_actual_robot_pose(supervisor, robot_name)
-                    if pose is None:
-                        pose = status["pose"]
                     cleanup_plan = send_cleanup_plan_if_needed(
                         emitter,
                         cleaning_overlay,
@@ -2572,12 +4469,19 @@ def run():
                         cleanup_plan_steps,
                         step_count,
                         cleanup_reason,
+                        operator_controls.no_go_zones,
+                        entry_blocked_is_reachable=robot_inside_room,
                     )
                     if cleanup_plan is not None:
                         coverage_plans[robot_name] = cleanup_plan
                     continue
 
-                if not room_reached_coverage_goal(cleaning_overlay, room):
+                if not room_reached_coverage_goal(
+                    cleaning_overlay,
+                    room,
+                    operator_controls.no_go_zones,
+                    exclude_entry_blocked=not room_has_inside_robot,
+                ):
                     continue
 
                 cleanup_plan_signatures.pop(robot_name, None)
@@ -2586,9 +4490,14 @@ def run():
                 if room not in completed_rooms:
                     completed_rooms.add(room)
                     cleaning_overlay.release_room_claims(room)
+                    room_progress = cleaning_overlay.room_progress_percent(
+                        room,
+                        operator_controls.no_go_zones,
+                        not room_has_inside_robot,
+                    )
                     print(
                         f"[supervisor] Room {room} reached "
-                        f"{cleaning_overlay.room_progress_percent(room):.1f}% clean"
+                        f"{room_progress:.1f}% clean"
                     )
 
                 if completed_robot_rooms.get(robot_name) == room:
@@ -2602,6 +4511,8 @@ def run():
                     cleaning_overlay,
                     latest_robot_status,
                     room_progress_monitors,
+                    operator_controls.priority_zones,
+                    operator_controls.no_go_zones,
                 )
                 if next_room is None:
                     send_idle_command(emitter, robot_name)
@@ -2631,6 +4542,7 @@ def run():
                     robot_status=status,
                     traffic_reservations=traffic_reservations,
                     step_count=step_count,
+                    no_go_zones=operator_controls.no_go_zones,
                 )
                 coverage_plans.update(
                     send_room_coverage_plans(
@@ -2640,21 +4552,54 @@ def run():
                         cleaning_overlay,
                         cleanup_plan_signatures,
                         cleanup_plan_steps,
+                        operator_controls.no_go_zones,
+                        latest_robot_status,
                     )
                 )
                 cleanup_plan_signatures.pop(robot_name, None)
                 cleanup_plan_steps.pop(robot_name, None)
                 cleaning_overlay.release_robot_claims(robot_name)
                 last_cleaning_poses.pop(robot_name, None)
+                next_room_progress = cleaning_overlay.room_progress_percent(
+                    next_room,
+                    operator_controls.no_go_zones,
+                )
                 print(
                     f"[supervisor] Reassigned {robot_name} to help {next_room}; "
-                    f"room_clean={cleaning_overlay.room_progress_percent(next_room):.1f}% "
+                    f"room_clean={next_room_progress:.1f}% "
                     f"coverage_waypoints={len(coverage_plans[robot_name])}"
                 )
 
+        if step_count % OPERATOR_STATE_WRITE_STEPS == 0:
+            try:
+                write_operator_state_file(
+                    operator_state_path,
+                    build_operator_state(
+                        supervisor,
+                        step_count,
+                        latest_robot_status,
+                        room_assignments,
+                        cleaning_overlay,
+                        operator_controls,
+                        operator_paused_robots,
+                        completed_rooms,
+                        traffic_reservations,
+                    ),
+                )
+            except OSError as exc:
+                if (
+                    step_count - last_operator_state_error_step
+                    >= COMMUNICATION_SUMMARY_INTERVAL_STEPS
+                ):
+                    last_operator_state_error_step = step_count
+                    print(f"[supervisor] Could not write operator state: {exc}")
+
         if step_count % COMMUNICATION_SUMMARY_INTERVAL_STEPS == 0:
             connected_count = len(latest_robot_status)
-            progress_snapshot = room_progress_snapshot(cleaning_overlay)
+            progress_snapshot = room_progress_snapshot(
+                cleaning_overlay,
+                operator_controls.no_go_zones,
+            )
             path_summary = traffic_reservations.summary()
             print(
                 f"[supervisor] Robot status: "
@@ -2690,7 +4635,8 @@ def run():
                 room_progress = 0.0
                 if assignment is not None:
                     room_progress = cleaning_overlay.room_progress_percent(
-                        assignment["room"]
+                        assignment["room"],
+                        operator_controls.no_go_zones,
                     )
                 route = status.get("assignment_route", {})
                 pose_text = f"pose=({pose['x_m']:.2f}, {pose['y_m']:.2f}) "

@@ -1,0 +1,24 @@
+{
+  "paused_robots": [],
+  "priority_zones": [
+    {
+      "name": "north rooms first",
+      "room": "n_medium",
+      "weight": 1.5
+    }
+  ],
+  "no_go_zones": [
+    {
+      "name": "avoid hub center",
+      "bounds": [-0.35, 0.35, -0.35, 0.35]
+    }
+  ],
+  "redirects": [
+    {
+      "id": "send-epuck-3-to-ne-large",
+      "robot": "epuck_3",
+      "room": "ne_large"
+    }
+  ],
+  "sim_reset_request": null
+}
