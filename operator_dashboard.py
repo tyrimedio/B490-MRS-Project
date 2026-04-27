@@ -246,6 +246,22 @@ def default_operator_state():
             "waiting_steps": 0,
             "doorway_conflicts": 0,
         },
+        "metrics": {
+            "elapsed_cleaning_time_s": None,
+            "coverage_percent": 0.0,
+            "coverage_target_percent": 95.0,
+            "coverage_target_met": False,
+            "coverage_target_time_s": None,
+            "complete_cleaning_time_s": None,
+            "inter_robot_collisions": 0,
+            "collision_free": True,
+            "minimum_robot_spacing_m": None,
+            "closest_robot_pair": [],
+            "single_robot_baseline_time_s": None,
+            "single_robot_baseline_metric": "elapsed_cleaning_time_s",
+            "time_reduction_percent": None,
+            "meets_time_reduction_target": None,
+        },
     }
 
 
@@ -1595,14 +1611,27 @@ COMPACT_HTML = r"""<!doctype html>
 
     function renderMetrics() {
       const sim = state.simState || {};
-      const traffic = sim.traffic || {};
+      const metrics = sim.metrics || {};
       const robots = sim.robots || [];
       const connected = robots.filter(robot => robot.connected).length;
       const step = sim.step === null || sim.step === undefined ? '--' : sim.step;
+      const coverage = Number(metrics.coverage_percent || 0).toFixed(1);
+      const cleanTime = metrics.elapsed_cleaning_time_s === null
+        || metrics.elapsed_cleaning_time_s === undefined
+        ? '--'
+        : `${Number(metrics.elapsed_cleaning_time_s).toFixed(1)}s`;
+      const collisions = metrics.inter_robot_collisions || 0;
+      const baseline = metrics.time_reduction_percent === null
+        || metrics.time_reduction_percent === undefined
+        ? '--'
+        : `${Number(metrics.time_reduction_percent).toFixed(1)}%`;
       document.getElementById('metrics').innerHTML = `
         <div class="metric">step<strong>${esc(step)}</strong></div>
         <div class="metric">robots<strong>${connected}/${state.robots.length}</strong></div>
-        <div class="metric">wait<strong>${esc(traffic.waiting_steps || 0)}</strong></div>
+        <div class="metric">coverage<strong>${esc(coverage)}%</strong></div>
+        <div class="metric">clean time<strong>${esc(cleanTime)}</strong></div>
+        <div class="metric">collisions<strong>${esc(collisions)}</strong></div>
+        <div class="metric">baseline<strong>${esc(baseline)}</strong></div>
       `;
     }
 

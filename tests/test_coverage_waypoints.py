@@ -1251,6 +1251,201 @@ class CoverageWaypointTests(unittest.TestCase):
         self.assertIn("ne_large=70.0%", formatted)
         self.assertIn("nw_small=100.0%", formatted)
 
+    def test_overall_coverage_percent_weights_every_room_tile(self):
+        supervisor = load_supervisor_module()
+        overlay = supervisor.CleaningOverlay.__new__(supervisor.CleaningOverlay)
+        overlay.room_tile_counts = {room: 10 for room in supervisor.ROOM_TASKS}
+        overlay.dirty_tiles = {
+            ("n_medium", 0, 0),
+            ("n_medium", 1, 0),
+            ("ne_large", 0, 0),
+        }
+
+        coverage_percent = supervisor.overall_coverage_percent(overlay)
+
+        self.assertAlmostEqual(95.0, coverage_percent)
+
+    def test_evaluation_metrics_track_target_time_and_collisions(self):
+        supervisor = load_supervisor_module()
+        overlay = supervisor.CleaningOverlay.__new__(supervisor.CleaningOverlay)
+        overlay.room_tile_counts = {room: 10 for room in supervisor.ROOM_TASKS}
+        overlay.dirty_tiles = {
+            ("n_medium", 0, 0),
+            ("n_medium", 1, 0),
+            ("ne_large", 0, 0),
+            ("ne_large", 1, 0),
+        }
+        metrics = supervisor.EvaluationMetrics(
+            single_robot_baseline_time_s=100.0,
+            single_robot_baseline_metric="coverage_target_time_s",
+        )
+
+        metrics.mark_started(10, 2.0)
+        self.assertEqual([], metrics.update_progress(overlay, 20, 5.0))
+
+        overlay.dirty_tiles = {("n_medium", 0, 0), ("ne_large", 0, 0)}
+        progress_events = metrics.update_progress(overlay, 30, 12.0)
+        self.assertEqual(1, len(progress_events))
+        self.assertIn("Coverage target reached", progress_events[0])
+
+        first_collision = metrics.update_collisions(
+            {
+                "epuck_1": {"x_m": 0.0, "y_m": 0.0},
+                "epuck_2": {"x_m": 0.03, "y_m": 0.0},
+            },
+            31,
+            12.1,
+        )
+        repeated_collision = metrics.update_collisions(
+            {
+                "epuck_1": {"x_m": 0.0, "y_m": 0.0},
+                "epuck_2": {"x_m": 0.04, "y_m": 0.0},
+            },
+            32,
+            12.2,
+        )
+
+        snapshot = metrics.snapshot(40, 14.0)
+
+        self.assertEqual(1, len(first_collision))
+        self.assertEqual([], repeated_collision)
+        self.assertEqual(10.0, snapshot["coverage_target_time_s"])
+        self.assertEqual(1, snapshot["inter_robot_collisions"])
+        self.assertFalse(snapshot["collision_free"])
+        self.assertEqual(90.0, snapshot["time_reduction_percent"])
+
+    def test_complete_baseline_waits_for_complete_cleaning_time(self):
+        supervisor = load_supervisor_module()
+        overlay = supervisor.CleaningOverlay.__new__(supervisor.CleaningOverlay)
+        overlay.room_tile_counts = {room: 10 for room in supervisor.ROOM_TASKS}
+        overlay.dirty_tiles = {
+            ("n_medium", 0, 0),
+            ("ne_large", 0, 0),
+        }
+        metrics = supervisor.EvaluationMetrics(
+            single_robot_baseline_time_s=100.0,
+            single_robot_baseline_metric="complete_cleaning_time_s",
+        )
+
+        metrics.mark_started(0, 0.0)
+        metrics.update_progress(overlay, 10, 10.0)
+        target_snapshot = metrics.snapshot(10, 10.0)
+
+        overlay.dirty_tiles = set()
+        metrics.update_progress(overlay, 40, 40.0)
+        complete_snapshot = metrics.snapshot(40, 40.0)
+
+        self.assertEqual(10.0, target_snapshot["coverage_target_time_s"])
+        self.assertIsNone(target_snapshot["complete_cleaning_time_s"])
+        self.assertIsNone(target_snapshot["time_reduction_percent"])
+        self.assertEqual(40.0, complete_snapshot["complete_cleaning_time_s"])
+        self.assertEqual(60.0, complete_snapshot["time_reduction_percent"])
+
+    def test_complete_time_reopens_when_coverage_drops_below_full(self):
+        supervisor = load_supervisor_module()
+        overlay = supervisor.CleaningOverlay.__new__(supervisor.CleaningOverlay)
+        overlay.room_tile_counts = {room: 10 for room in supervisor.ROOM_TASKS}
+        overlay.dirty_tiles = set()
+        metrics = supervisor.EvaluationMetrics()
+
+        metrics.mark_started(0, 0.0)
+        metrics.update_progress(overlay, 10, 10.0)
+        complete_snapshot = metrics.snapshot(10, 10.0)
+
+        overlay.dirty_tiles = {("n_medium", 0, 0)}
+        metrics.update_progress(overlay, 20, 20.0)
+        reopened_snapshot = metrics.snapshot(20, 20.0)
+
+        overlay.dirty_tiles = set()
+        metrics.update_progress(overlay, 30, 30.0)
+        recomplete_snapshot = metrics.snapshot(30, 30.0)
+
+        self.assertEqual(10.0, complete_snapshot["complete_cleaning_time_s"])
+        self.assertIsNone(reopened_snapshot["complete_cleaning_time_s"])
+        self.assertEqual(20.0, reopened_snapshot["elapsed_cleaning_time_s"])
+        self.assertEqual(30.0, recomplete_snapshot["complete_cleaning_time_s"])
+
+    def test_coverage_target_reopens_when_progress_drops_below_target(self):
+        supervisor = load_supervisor_module()
+        overlay = supervisor.CleaningOverlay.__new__(supervisor.CleaningOverlay)
+        overlay.room_tile_counts = {room: 10 for room in supervisor.ROOM_TASKS}
+        overlay.dirty_tiles = {
+            ("n_medium", 0, 0),
+            ("ne_large", 0, 0),
+        }
+        metrics = supervisor.EvaluationMetrics(
+            single_robot_baseline_time_s=100.0,
+            single_robot_baseline_metric="coverage_target_time_s",
+        )
+
+        metrics.mark_started(0, 0.0)
+        metrics.update_progress(overlay, 10, 10.0)
+        target_snapshot = metrics.snapshot(10, 10.0)
+
+        overlay.dirty_tiles = {
+            ("n_medium", 0, 0),
+            ("n_medium", 1, 0),
+            ("ne_large", 0, 0),
+            ("ne_large", 1, 0),
+        }
+        metrics.update_progress(overlay, 20, 20.0)
+        reopened_snapshot = metrics.snapshot(20, 20.0)
+
+        overlay.dirty_tiles = {
+            ("n_medium", 0, 0),
+            ("ne_large", 0, 0),
+        }
+        metrics.update_progress(overlay, 30, 30.0)
+        retargeted_snapshot = metrics.snapshot(30, 30.0)
+
+        self.assertEqual(10.0, target_snapshot["coverage_target_time_s"])
+        self.assertTrue(target_snapshot["coverage_target_met"])
+        self.assertIsNone(reopened_snapshot["coverage_target_time_s"])
+        self.assertFalse(reopened_snapshot["coverage_target_met"])
+        self.assertIsNone(reopened_snapshot["time_reduction_percent"])
+        self.assertEqual(30.0, retargeted_snapshot["coverage_target_time_s"])
+        self.assertEqual(70.0, retargeted_snapshot["time_reduction_percent"])
+
+    def test_single_robot_baseline_loader_accepts_metrics_json(self):
+        supervisor = load_supervisor_module()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            baseline_path = Path(temp_dir) / "single_robot_baseline.json"
+            baseline_path.write_text(
+                json.dumps({"cleaning_time_s": 123.456}),
+                encoding="utf-8",
+            )
+            object_baseline = supervisor.load_single_robot_baseline(baseline_path)
+
+            baseline_path.write_text("90.5", encoding="utf-8")
+            numeric_baseline = supervisor.load_single_robot_baseline(baseline_path)
+
+            baseline_path.write_text(
+                json.dumps({"complete_cleaning_time_s": 88.0}),
+                encoding="utf-8",
+            )
+            complete_baseline = supervisor.load_single_robot_baseline(baseline_path)
+
+            baseline_path.write_text(
+                json.dumps({"cleaning_time_s": -1.0}),
+                encoding="utf-8",
+            )
+            invalid_baseline = supervisor.load_single_robot_baseline(baseline_path)
+
+        self.assertEqual(
+            {"time_s": 123.456, "metric": "elapsed_cleaning_time_s"},
+            object_baseline,
+        )
+        self.assertEqual(
+            {"time_s": 90.5, "metric": "elapsed_cleaning_time_s"},
+            numeric_baseline,
+        )
+        self.assertEqual(
+            {"time_s": 88.0, "metric": "complete_cleaning_time_s"},
+            complete_baseline,
+        )
+        self.assertIsNone(invalid_baseline)
+
     def test_operator_state_reports_robot_rooms_and_progress(self):
         supervisor = load_supervisor_module()
         overlay = supervisor.CleaningOverlay.__new__(supervisor.CleaningOverlay)
@@ -1325,6 +1520,7 @@ class CoverageWaypointTests(unittest.TestCase):
         self.assertEqual(["north block"], n_medium["no_go_zones"])
         self.assertEqual([], nw_small["no_go_zones"])
         self.assertEqual(1, state["traffic"]["doorway_conflicts"])
+        self.assertIn("coverage_percent", state["metrics"])
 
     def test_operator_state_counts_blocked_room_dirt_when_robot_is_inside(self):
         supervisor = load_supervisor_module()
