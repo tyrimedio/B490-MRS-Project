@@ -64,6 +64,8 @@ TRAFFIC_RESOURCE_STAGGER_STEPS = 24
 TRAFFIC_MAX_START_DELAY_STEPS = 120
 OPERATOR_CONTROL_FILE = "operator_controls.json"
 OPERATOR_STATE_FILE = "operator_state.json"
+EVALUATION_METRICS_FILE = "evaluation_metrics.json"
+SINGLE_ROBOT_BASELINE_FILE = "single_robot_baseline.json"
 OPERATOR_CONTROL_POLL_STEPS = 30
 OPERATOR_STATE_WRITE_STEPS = 15
 OPERATOR_MAX_PRIORITY_ZONES = 6
@@ -82,6 +84,8 @@ DIRTY_TILE_TRANSPARENCY = 0.35
 CLEAN_TILE_COLOR = [0.18, 0.62, 0.42]
 CLEAN_TILE_TRANSPARENCY = 0.15
 HIDDEN_TILE_TRANSPARENCY = 1.0
+EVALUATION_COVERAGE_TARGET_PERCENT = 95.0
+INTER_ROBOT_COLLISION_DISTANCE_M = 0.08
 GRID_UNKNOWN = -1
 GRID_FREE = 0
 GRID_WALL = 1
@@ -2166,6 +2170,7 @@ def default_operator_state_snapshot():
             "waiting_steps": 0,
             "doorway_conflicts": 0,
         },
+        "metrics": default_evaluation_metrics_snapshot(),
     }
 
 
@@ -2544,6 +2549,307 @@ def room_dirty_percent(
     ) / total_tiles
 
 
+def overall_coverage_percent(cleaning_overlay, no_go_zones=None):
+    """Return weighted whole-arena cleaning coverage from 0 to 100."""
+    total_tiles = 0
+    dirty_tiles = 0
+    for room in ROOM_TASKS:
+        total_tiles += cleaning_overlay.room_tile_counts.get(room, 0)
+        dirty_tiles += room_dirty_tile_count(
+            cleaning_overlay,
+            room,
+            no_go_zones,
+            exclude_entry_blocked=False,
+        )
+
+    if total_tiles <= 0:
+        return 0.0
+    clean_tiles = max(0, total_tiles - dirty_tiles)
+    return 100.0 * clean_tiles / total_tiles
+
+
+def default_evaluation_metrics_snapshot():
+    """Return empty run metrics for the dashboard and JSON exports."""
+    return {
+        "elapsed_cleaning_time_s": None,
+        "coverage_percent": 0.0,
+        "coverage_target_percent": EVALUATION_COVERAGE_TARGET_PERCENT,
+        "coverage_target_met": False,
+        "coverage_target_time_s": None,
+        "complete_cleaning_time_s": None,
+        "inter_robot_collisions": 0,
+        "collision_free": True,
+        "minimum_robot_spacing_m": None,
+        "closest_robot_pair": [],
+        "single_robot_baseline_time_s": None,
+        "single_robot_baseline_metric": "elapsed_cleaning_time_s",
+        "time_reduction_percent": None,
+        "meets_time_reduction_target": None,
+    }
+
+
+def load_single_robot_baseline(baseline_path):
+    """
+    Read the optional single-robot baseline time.
+
+    The baseline file can be either a number or a JSON object with
+    cleaning_time_s, coverage_95_time_s, or complete_cleaning_time_s.
+    """
+    path = Path(baseline_path)
+    if not path.exists():
+        return None
+
+    try:
+        raw_baseline = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    baseline_metric = "elapsed_cleaning_time_s"
+    if isinstance(raw_baseline, (int, float)):
+        baseline_time_s = float(raw_baseline)
+    elif isinstance(raw_baseline, dict):
+        baseline_time_s = None
+        baseline_keys = (
+            ("cleaning_time_s", "elapsed_cleaning_time_s"),
+            ("coverage_95_time_s", "coverage_target_time_s"),
+            ("coverage_target_time_s", "coverage_target_time_s"),
+            ("complete_cleaning_time_s", "complete_cleaning_time_s"),
+        )
+        for key, metric in baseline_keys:
+            value = raw_baseline.get(key)
+            if isinstance(value, (int, float)):
+                baseline_time_s = float(value)
+                baseline_metric = metric
+                break
+    else:
+        baseline_time_s = None
+
+    if baseline_time_s is None or baseline_time_s <= 0.0:
+        return None
+    return {
+        "time_s": round(baseline_time_s, 3),
+        "metric": baseline_metric,
+    }
+
+
+class EvaluationMetrics:
+    """Track the quick demo metrics used for scaling and evaluation."""
+
+    def __init__(
+        self,
+        single_robot_baseline_time_s=None,
+        single_robot_baseline_metric="elapsed_cleaning_time_s",
+        coverage_target_percent=EVALUATION_COVERAGE_TARGET_PERCENT,
+        collision_distance_m=INTER_ROBOT_COLLISION_DISTANCE_M,
+    ):
+        self.single_robot_baseline_time_s = single_robot_baseline_time_s
+        self.single_robot_baseline_metric = single_robot_baseline_metric
+        self.coverage_target_percent = coverage_target_percent
+        self.collision_distance_m = collision_distance_m
+        self.reset()
+
+    def reset(self):
+        """Clear all per-run measurements."""
+        self.start_step = None
+        self.start_time_s = None
+        self.coverage_percent = 0.0
+        self.coverage_target_step = None
+        self.coverage_target_time_s = None
+        self.complete_step = None
+        self.complete_time_s = None
+        self.inter_robot_collisions = 0
+        self.active_collision_pairs = set()
+        self.minimum_robot_spacing_m = None
+        self.closest_robot_pair = []
+
+    def mark_started(self, step_count, webots_time_s):
+        """Start the cleaning timer once the first room tasks are sent."""
+        if self.start_time_s is not None:
+            return
+        self.start_step = step_count
+        self.start_time_s = webots_time_s
+
+    def update_progress(
+        self,
+        cleaning_overlay,
+        step_count,
+        webots_time_s,
+        no_go_zones=None,
+    ):
+        """Refresh coverage and return notable log events."""
+        events = []
+        self.coverage_percent = overall_coverage_percent(
+            cleaning_overlay,
+            no_go_zones,
+        )
+        if self.start_time_s is None:
+            return events
+
+        if self.coverage_percent < 100.0 and self.complete_time_s is not None:
+            self.complete_step = None
+            self.complete_time_s = None
+        if (
+            self.coverage_percent < self.coverage_target_percent
+            and self.coverage_target_time_s is not None
+        ):
+            self.coverage_target_step = None
+            self.coverage_target_time_s = None
+
+        if (
+            self.coverage_target_time_s is None
+            and self.coverage_percent >= self.coverage_target_percent
+        ):
+            self.coverage_target_step = step_count
+            self.coverage_target_time_s = webots_time_s
+            elapsed_s = self.coverage_target_time_s - self.start_time_s
+            events.append(
+                f"Coverage target reached: {self.coverage_percent:.1f}% "
+                f"in {elapsed_s:.1f}s"
+            )
+
+        if self.complete_time_s is None and self.coverage_percent >= 100.0:
+            self.complete_step = step_count
+            self.complete_time_s = webots_time_s
+            elapsed_s = self.complete_time_s - self.start_time_s
+            events.append(f"Full coverage reached in {elapsed_s:.1f}s")
+
+        return events
+
+    def update_collisions(self, robot_poses, step_count, webots_time_s):
+        """Count new robot-pair contacts based on center-to-center distance."""
+        del step_count, webots_time_s
+        events = []
+        current_collision_pairs = set()
+        pose_items = [
+            (robot_name, pose)
+            for robot_name, pose in robot_poses.items()
+            if pose is not None
+        ]
+        for first_index, (first_robot, first_pose) in enumerate(pose_items):
+            for second_robot, second_pose in pose_items[first_index + 1:]:
+                distance_m = math.hypot(
+                    second_pose["x_m"] - first_pose["x_m"],
+                    second_pose["y_m"] - first_pose["y_m"],
+                )
+                if (
+                    self.minimum_robot_spacing_m is None
+                    or distance_m < self.minimum_robot_spacing_m
+                ):
+                    self.minimum_robot_spacing_m = distance_m
+                    self.closest_robot_pair = [first_robot, second_robot]
+
+                if distance_m > self.collision_distance_m:
+                    continue
+
+                pair = tuple(sorted((first_robot, second_robot)))
+                current_collision_pairs.add(pair)
+                if pair in self.active_collision_pairs:
+                    continue
+
+                self.inter_robot_collisions += 1
+                events.append(
+                    f"Inter-robot collision detected: {pair[0]} and {pair[1]} "
+                    f"within {distance_m:.3f}m"
+                )
+
+        self.active_collision_pairs = current_collision_pairs
+        return events
+
+    def elapsed_cleaning_time_s(self, current_time_s):
+        """Return seconds since cleaning tasks started, or None before start."""
+        if self.start_time_s is None:
+            return None
+        end_time_s = self.complete_time_s
+        if end_time_s is None:
+            end_time_s = current_time_s
+        if end_time_s is None:
+            return None
+        return max(0.0, end_time_s - self.start_time_s)
+
+    def elapsed_target_time_s(self):
+        """Return seconds from assignment to the 95% target, if reached."""
+        if self.start_time_s is None or self.coverage_target_time_s is None:
+            return None
+        return max(0.0, self.coverage_target_time_s - self.start_time_s)
+
+    def elapsed_complete_time_s(self):
+        """Return seconds from assignment to full coverage, if reached."""
+        if self.start_time_s is None or self.complete_time_s is None:
+            return None
+        return max(0.0, self.complete_time_s - self.start_time_s)
+
+    def comparison_time_s(self, current_time_s):
+        """Pick the current run time that matches the baseline's meaning."""
+        if self.single_robot_baseline_metric == "coverage_target_time_s":
+            return self.elapsed_target_time_s()
+        if self.single_robot_baseline_metric == "complete_cleaning_time_s":
+            return self.elapsed_complete_time_s()
+        return self.elapsed_cleaning_time_s(current_time_s)
+
+    def snapshot(self, step_count=None, webots_time_s=None):
+        """Return serializable metrics for logs, dashboard, and report data."""
+        del step_count
+        snapshot = default_evaluation_metrics_snapshot()
+        elapsed_time_s = self.elapsed_cleaning_time_s(webots_time_s)
+        target_time_s = self.elapsed_target_time_s()
+        complete_time_s = self.elapsed_complete_time_s()
+        comparison_time_s = self.comparison_time_s(webots_time_s)
+
+        snapshot.update(
+            {
+                "elapsed_cleaning_time_s": (
+                    None if elapsed_time_s is None else round(elapsed_time_s, 1)
+                ),
+                "coverage_percent": round(self.coverage_percent, 1),
+                "coverage_target_percent": round(self.coverage_target_percent, 1),
+                "coverage_target_met": target_time_s is not None,
+                "coverage_target_time_s": (
+                    None if target_time_s is None else round(target_time_s, 1)
+                ),
+                "complete_cleaning_time_s": (
+                    None if complete_time_s is None else round(complete_time_s, 1)
+                ),
+                "inter_robot_collisions": self.inter_robot_collisions,
+                "collision_free": self.inter_robot_collisions == 0,
+                "minimum_robot_spacing_m": (
+                    None
+                    if self.minimum_robot_spacing_m is None
+                    else round(self.minimum_robot_spacing_m, 3)
+                ),
+                "closest_robot_pair": list(self.closest_robot_pair),
+                "single_robot_baseline_time_s": self.single_robot_baseline_time_s,
+                "single_robot_baseline_metric": self.single_robot_baseline_metric,
+            }
+        )
+
+        if (
+            self.single_robot_baseline_time_s is not None
+            and comparison_time_s is not None
+        ):
+            reduction_percent = (
+                (self.single_robot_baseline_time_s - comparison_time_s)
+                / self.single_robot_baseline_time_s
+                * 100.0
+            )
+            snapshot["time_reduction_percent"] = round(reduction_percent, 1)
+            snapshot["meets_time_reduction_target"] = reduction_percent >= 50.0
+
+        return snapshot
+
+
+def current_robot_poses(supervisor, latest_robot_status):
+    """Return actual Webots poses when available, otherwise last reported poses."""
+    robot_poses = {}
+    for robot_name in EXPECTED_ROBOTS:
+        pose = get_actual_robot_pose(supervisor, robot_name)
+        if pose is None:
+            status = latest_robot_status.get(robot_name)
+            pose = status.get("pose") if isinstance(status, dict) else None
+        if pose is not None:
+            robot_poses[robot_name] = pose
+    return robot_poses
+
+
 def pose_for_operator_state(pose):
     """Return a small pose object for the operator dashboard."""
     if pose is None:
@@ -2575,9 +2881,15 @@ def build_operator_state(
     operator_paused_robots,
     completed_rooms,
     traffic_reservations,
+    evaluation_metrics=None,
+    webots_time_s=None,
 ):
     """Build the live snapshot consumed by the operator dashboard."""
     path_summary = traffic_reservations.summary()
+    if evaluation_metrics is None:
+        metrics_snapshot = default_evaluation_metrics_snapshot()
+    else:
+        metrics_snapshot = evaluation_metrics.snapshot(step_count, webots_time_s)
     paused_robots = sorted(operator_paused_robots)
     robots = []
 
@@ -2683,6 +2995,7 @@ def build_operator_state(
             "waiting_steps": path_summary["waiting_steps"],
             "doorway_conflicts": path_summary["doorway_conflicts"],
         },
+        "metrics": metrics_snapshot,
     }
 
 
@@ -2692,6 +3005,18 @@ def write_operator_state_file(state_path, operator_state):
     path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = path.with_suffix(path.suffix + ".tmp")
     temp_path.write_text(json.dumps(operator_state, indent=2) + "\n", encoding="utf-8")
+    temp_path.replace(path)
+
+
+def write_evaluation_metrics_file(metrics_path, metrics_snapshot):
+    """Write a compact metrics file that can be copied into the report."""
+    path = Path(metrics_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    temp_path.write_text(
+        json.dumps(metrics_snapshot, indent=2) + "\n",
+        encoding="utf-8",
+    )
     temp_path.replace(path)
 
 
@@ -3737,6 +4062,20 @@ def run():
     cleaning_overlay = CleaningOverlay(supervisor, ROOM_TASKS)
     operator_controls = OperatorControls(supervisor, operator_control_path)
     operator_state_path = repo_root / OPERATOR_STATE_FILE
+    evaluation_metrics_path = repo_root / EVALUATION_METRICS_FILE
+    single_robot_baseline = load_single_robot_baseline(
+        repo_root / SINGLE_ROBOT_BASELINE_FILE
+    )
+    if single_robot_baseline is None:
+        single_robot_baseline_time_s = None
+        single_robot_baseline_metric = "elapsed_cleaning_time_s"
+    else:
+        single_robot_baseline_time_s = single_robot_baseline["time_s"]
+        single_robot_baseline_metric = single_robot_baseline["metric"]
+    evaluation_metrics = EvaluationMetrics(
+        single_robot_baseline_time_s,
+        single_robot_baseline_metric,
+    )
     task_allocator = TaskAllocator(
         rooms=ROOM_TASKS,
         distance_weight=MRTA_DISTANCE_WEIGHT,
@@ -3787,6 +4126,7 @@ def run():
         operator_paused_assignments.clear()
         completed_rooms.clear()
         completed_robot_rooms.clear()
+        evaluation_metrics.reset()
         assignments_sent = False
         last_operator_no_go_signature = operator_zone_signature(
             operator_controls.no_go_zones
@@ -3802,6 +4142,16 @@ def run():
         f"[supervisor] Global map ready: "
         f"{global_grid.width}x{global_grid.height} cells"
     )
+    if single_robot_baseline_time_s is None:
+        print(
+            "[supervisor] Single-robot baseline not loaded; "
+            f"add {SINGLE_ROBOT_BASELINE_FILE} with cleaning_time_s to compare"
+        )
+    else:
+        print(
+            "[supervisor] Single-robot baseline loaded: "
+            f"{single_robot_baseline_time_s:.1f}s"
+        )
 
     while supervisor.step(timestep) != -1:
         step_count += 1
@@ -3924,6 +4274,20 @@ def run():
             else:
                 last_cleaning_poses.pop(robot_name, None)
 
+        for metrics_event in evaluation_metrics.update_collisions(
+            current_robot_poses(supervisor, latest_robot_status),
+            step_count,
+            webots_time_s,
+        ):
+            print(f"[supervisor] {metrics_event}")
+        for metrics_event in evaluation_metrics.update_progress(
+            cleaning_overlay,
+            step_count,
+            webots_time_s,
+            operator_controls.no_go_zones,
+        ):
+            print(f"[supervisor] {metrics_event}")
+
         if step_count % GROUND_TRUTH_POSE_CORRECTION_INTERVAL_STEPS == 0:
             for robot_name in EXPECTED_ROBOTS:
                 status = latest_robot_status.get(robot_name)
@@ -3976,6 +4340,7 @@ def run():
                         f"wait={assignment['start_delay_steps']} step(s)"
                     )
                 assignments_sent = True
+                evaluation_metrics.mark_started(step_count, webots_time_s)
 
         if assignments_sent:
             if operator_no_go_changed:
@@ -4572,19 +4937,26 @@ def run():
 
         if step_count % OPERATOR_STATE_WRITE_STEPS == 0:
             try:
+                operator_state = build_operator_state(
+                    supervisor,
+                    step_count,
+                    latest_robot_status,
+                    room_assignments,
+                    cleaning_overlay,
+                    operator_controls,
+                    operator_paused_robots,
+                    completed_rooms,
+                    traffic_reservations,
+                    evaluation_metrics,
+                    webots_time_s,
+                )
                 write_operator_state_file(
                     operator_state_path,
-                    build_operator_state(
-                        supervisor,
-                        step_count,
-                        latest_robot_status,
-                        room_assignments,
-                        cleaning_overlay,
-                        operator_controls,
-                        operator_paused_robots,
-                        completed_rooms,
-                        traffic_reservations,
-                    ),
+                    operator_state,
+                )
+                write_evaluation_metrics_file(
+                    evaluation_metrics_path,
+                    operator_state["metrics"],
                 )
             except OSError as exc:
                 if (
@@ -4592,7 +4964,7 @@ def run():
                     >= COMMUNICATION_SUMMARY_INTERVAL_STEPS
                 ):
                     last_operator_state_error_step = step_count
-                    print(f"[supervisor] Could not write operator state: {exc}")
+                    print(f"[supervisor] Could not write dashboard metrics: {exc}")
 
         if step_count % COMMUNICATION_SUMMARY_INTERVAL_STEPS == 0:
             connected_count = len(latest_robot_status)
@@ -4601,6 +4973,18 @@ def run():
                 operator_controls.no_go_zones,
             )
             path_summary = traffic_reservations.summary()
+            metrics_snapshot = evaluation_metrics.snapshot(
+                step_count,
+                webots_time_s,
+            )
+            clean_time_s = metrics_snapshot["elapsed_cleaning_time_s"]
+            clean_time_text = "--" if clean_time_s is None else f"{clean_time_s:.1f}s"
+            reduction_percent = metrics_snapshot["time_reduction_percent"]
+            reduction_text = (
+                "--"
+                if reduction_percent is None
+                else f"{reduction_percent:.1f}%"
+            )
             print(
                 f"[supervisor] Robot status: "
                 f"{connected_count}/{len(EXPECTED_ROBOTS)} reporting, "
@@ -4609,6 +4993,11 @@ def run():
                 f"path_distance={path_summary['planned_distance_m']:.2f}m "
                 f"path_wait={path_summary['waiting_steps']} step(s) "
                 f"doorway_conflicts={path_summary['doorway_conflicts']} "
+                f"coverage={metrics_snapshot['coverage_percent']:.1f}% "
+                f"target95={metrics_snapshot['coverage_target_met']} "
+                f"clean_time={clean_time_text} "
+                f"collisions={metrics_snapshot['inter_robot_collisions']} "
+                f"baseline_reduction={reduction_text} "
                 f"room_progress {format_room_progress(progress_snapshot)}"
             )
             for robot_name in EXPECTED_ROBOTS:
