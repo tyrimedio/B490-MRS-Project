@@ -75,7 +75,22 @@ LAUNCH_TURN_GAIN = 2.2
 LAUNCH_TURN_LIMIT = 0.50 * MAX_SPEED
 LAUNCH_SPIN_THRESHOLD_RAD = 1.05
 LAUNCH_SPIN_SPEED = 0.45 * MAX_SPEED
+ASSIGNMENT_DISTANCE_GAIN = 8.0
+ASSIGNMENT_MIN_SPEED = 0.40 * MAX_SPEED
+ASSIGNMENT_MAX_SPEED = 0.95 * MAX_SPEED
+ASSIGNMENT_TURN_GAIN = 2.6
+ASSIGNMENT_TURN_LIMIT = 0.42 * MAX_SPEED
+ASSIGNMENT_SPIN_THRESHOLD_RAD = 2.35
+ASSIGNMENT_SPIN_SPEED = 0.65 * MAX_SPEED
+COVERAGE_DISTANCE_GAIN = 8.0
+COVERAGE_MIN_SPEED = 0.45 * MAX_SPEED
+COVERAGE_MAX_SPEED = 0.88 * MAX_SPEED
+COVERAGE_TURN_GAIN = 2.4
+COVERAGE_TURN_LIMIT = 0.42 * MAX_SPEED
+COVERAGE_SPIN_THRESHOLD_RAD = 2.35
+COVERAGE_SPIN_SPEED = 0.60 * MAX_SPEED
 ASSIGNMENT_TARGET_REACHED_M = 0.20
+ASSIGNMENT_ROUTE_WAYPOINT_REACHED_M = 0.10
 COVERAGE_WAYPOINT_REACHED_M = 0.05
 
 # Corner recovery behavior
@@ -99,7 +114,37 @@ MIN_OCCUPANCY_SCORE = -8
 MAX_OCCUPANCY_SCORE = 8
 FREE_SCORE_THRESHOLD = -2
 WALL_SCORE_THRESHOLD = 3
-CONTROLLER_BUILD = "2026-04-10-log-throttle-v4"
+CONTROLLER_BUILD = "2026-04-27-smooth-drive-v1"
+
+DRIVE_PROFILES = {
+    "launch": {
+        "distance_gain": LAUNCH_DISTANCE_GAIN,
+        "min_speed": LAUNCH_MIN_SPEED,
+        "max_speed": LAUNCH_MAX_SPEED,
+        "turn_gain": LAUNCH_TURN_GAIN,
+        "turn_limit": LAUNCH_TURN_LIMIT,
+        "spin_threshold_rad": LAUNCH_SPIN_THRESHOLD_RAD,
+        "spin_speed": LAUNCH_SPIN_SPEED,
+    },
+    "assignment": {
+        "distance_gain": ASSIGNMENT_DISTANCE_GAIN,
+        "min_speed": ASSIGNMENT_MIN_SPEED,
+        "max_speed": ASSIGNMENT_MAX_SPEED,
+        "turn_gain": ASSIGNMENT_TURN_GAIN,
+        "turn_limit": ASSIGNMENT_TURN_LIMIT,
+        "spin_threshold_rad": ASSIGNMENT_SPIN_THRESHOLD_RAD,
+        "spin_speed": ASSIGNMENT_SPIN_SPEED,
+    },
+    "coverage": {
+        "distance_gain": COVERAGE_DISTANCE_GAIN,
+        "min_speed": COVERAGE_MIN_SPEED,
+        "max_speed": COVERAGE_MAX_SPEED,
+        "turn_gain": COVERAGE_TURN_GAIN,
+        "turn_limit": COVERAGE_TURN_LIMIT,
+        "spin_threshold_rad": COVERAGE_SPIN_THRESHOLD_RAD,
+        "spin_speed": COVERAGE_SPIN_SPEED,
+    },
+}
 
 
 class OccupancyGrid:
@@ -124,7 +169,7 @@ class OccupancyGrid:
         self.pending_wall_cells = set()
         self.pending_free_observations = {}
         self.pending_wall_observations = {}
-        self.pending_observations = []
+        self.pending_observation_runs = {}
         self.reset()
 
     def reset(self):
@@ -143,7 +188,7 @@ class OccupancyGrid:
         self.pending_wall_cells = set()
         self.pending_free_observations = {}
         self.pending_wall_observations = {}
-        self.pending_observations = []
+        self.pending_observation_runs = {}
 
     def world_to_grid(self, x_m, y_m):
         """Convert local map coordinates in meters to grid cell indices."""
@@ -182,19 +227,14 @@ class OccupancyGrid:
         return self.add_cell_evidence(grid_x, grid_y, FREE_EVIDENCE)
 
     def append_pending_observation(self, kind, grid_x, grid_y):
-        """Remember evidence in the same order the robot observed it."""
-        if self.pending_observations:
-            last_kind, last_grid_x, last_grid_y, last_count = self.pending_observations[-1]
-            if last_kind == kind and last_grid_x == grid_x and last_grid_y == grid_y:
-                self.pending_observations[-1] = [
-                    last_kind,
-                    last_grid_x,
-                    last_grid_y,
-                    last_count + 1,
-                ]
-                return
+        """Remember ordered evidence for one cell without repeating every scan."""
+        cell = (grid_x, grid_y)
+        runs = self.pending_observation_runs.setdefault(cell, [])
+        if runs and runs[-1][0] == kind:
+            runs[-1][3] += 1
+            return
 
-        self.pending_observations.append([kind, grid_x, grid_y, 1])
+        runs.append([kind, grid_x, grid_y, 1])
 
     def add_cell_evidence(self, grid_x, grid_y, evidence):
         """Update one cell's score and public map state."""
@@ -278,13 +318,17 @@ class OccupancyGrid:
                 [cell[0], cell[1], count]
                 for cell, count in sorted(self.pending_wall_observations.items())
             ],
-            "observations": list(self.pending_observations),
+            "observations": [
+                list(observation)
+                for cell in sorted(self.pending_observation_runs)
+                for observation in self.pending_observation_runs[cell]
+            ],
         }
         self.pending_free_cells.clear()
         self.pending_wall_cells.clear()
         self.pending_free_observations.clear()
         self.pending_wall_observations.clear()
-        self.pending_observations.clear()
+        self.pending_observation_runs.clear()
         return updates
 
 
@@ -394,27 +438,39 @@ def get_optional_device(robot, device_name):
         return None
 
 
-def drive_toward_target(robot_x_m, robot_y_m, robot_theta_rad, target_x_m, target_y_m):
+def drive_toward_target(
+    robot_x_m,
+    robot_y_m,
+    robot_theta_rad,
+    target_x_m,
+    target_y_m,
+    profile_name="launch",
+):
     """Return wheel speeds that steer toward one world-frame target point."""
+    drive_profile = DRIVE_PROFILES.get(profile_name, DRIVE_PROFILES["launch"])
     delta_x_m = target_x_m - robot_x_m
     delta_y_m = target_y_m - robot_y_m
     target_distance_m = math.hypot(delta_x_m, delta_y_m)
     target_heading_rad = math.atan2(delta_y_m, delta_x_m)
     heading_error_rad = normalize_angle(target_heading_rad - robot_theta_rad)
 
-    if abs(heading_error_rad) > LAUNCH_SPIN_THRESHOLD_RAD:
-        spin_speed = LAUNCH_SPIN_SPEED if heading_error_rad > 0 else -LAUNCH_SPIN_SPEED
+    if abs(heading_error_rad) > drive_profile["spin_threshold_rad"]:
+        spin_speed = (
+            drive_profile["spin_speed"]
+            if heading_error_rad > 0
+            else -drive_profile["spin_speed"]
+        )
         return -spin_speed, spin_speed
 
     forward_speed = clamp(
-        LAUNCH_DISTANCE_GAIN * target_distance_m,
-        LAUNCH_MIN_SPEED,
-        LAUNCH_MAX_SPEED,
+        drive_profile["distance_gain"] * target_distance_m,
+        drive_profile["min_speed"],
+        drive_profile["max_speed"],
     )
     turn_speed = clamp(
-        LAUNCH_TURN_GAIN * heading_error_rad,
-        -LAUNCH_TURN_LIMIT,
-        LAUNCH_TURN_LIMIT,
+        drive_profile["turn_gain"] * heading_error_rad,
+        -drive_profile["turn_limit"],
+        drive_profile["turn_limit"],
     )
     left_speed = clamp(forward_speed - turn_speed, -MAX_SPEED, MAX_SPEED)
     right_speed = clamp(forward_speed + turn_speed, -MAX_SPEED, MAX_SPEED)
@@ -424,6 +480,13 @@ def drive_toward_target(robot_x_m, robot_y_m, robot_theta_rad, target_x_m, targe
 def should_hold_for_assignment(launch_finished, launch_timed_out, assigned_target):
     """Return whether the robot should wait at launch staging."""
     return (launch_finished or launch_timed_out) and assigned_target is None
+
+
+def assignment_waypoint_reached_distance(assignment_route, waypoint_index):
+    """Return the distance threshold for one assignment route waypoint."""
+    if waypoint_index >= len(assignment_route) - 1:
+        return ASSIGNMENT_TARGET_REACHED_M
+    return ASSIGNMENT_ROUTE_WAYPOINT_REACHED_M
 
 
 def should_hold_after_task(assigned_target, assignment_target_reached, coverage_complete):
@@ -685,6 +748,49 @@ def run():
                         coverage_lane_index = 0
                         coverage_lane_count = 1
                         print(f"[{robot_name}] Holding idle")
+                elif command_message.get("type") == "sim_reset":
+                    target_robot = command_message.get("robot")
+                    if target_robot in (robot_name, "all"):
+                        left_motor.setVelocity(0.0)
+                        right_motor.setVelocity(0.0)
+                        step_count = 0
+                        left_speed_cmd = 0.0
+                        right_speed_cmd = 0.0
+                        robot_x_m = start_x_m
+                        robot_y_m = start_y_m
+                        robot_theta_rad = start_theta_rad
+                        odometry_distance_since_correction_m = 0.0
+                        odometry_turn_since_correction_rad = 0.0
+                        pose_correction_count = 0
+                        last_pose_correction_source = "dashboard_reset"
+                        corner_pressure_steps = 0
+                        escape_reverse_steps = 0
+                        escape_turn_steps = 0
+                        escape_turn_left = True
+                        launch_waypoint_index = 0
+                        mapping_enabled = len(launch_waypoints) == 0
+                        launch_timed_out = False
+                        assigned_room = None
+                        assigned_target = None
+                        assignment_route = []
+                        assignment_route_index = 0
+                        assignment_target_reached = False
+                        assignment_start_delay_steps = 0
+                        assignment_wait_steps_remaining = 0
+                        assignment_planned_distance_m = 0.0
+                        coverage_room = None
+                        coverage_waypoints = []
+                        coverage_waypoint_index = 0
+                        coverage_complete = False
+                        coverage_plan_kind = "sweep"
+                        coverage_lane_index = 0
+                        coverage_lane_count = 1
+                        last_wall_hit = None
+                        last_lidar_log_steps.clear()
+                        last_pose_correction_log_step = -POSE_CORRECTION_LOG_INTERVAL_STEPS
+                        last_robot_phase = None
+                        occupancy_grid.reset()
+                        print(f"[{robot_name}] Dashboard sim reset applied")
                 elif command_message.get("type") == "coverage_plan":
                     target_robot = command_message.get("robot")
                     if target_robot in (robot_name, "all"):
@@ -950,8 +1056,12 @@ def run():
                 delta_x_m = target_x_m - robot_x_m
                 delta_y_m = target_y_m - robot_y_m
                 target_distance_m = math.hypot(delta_x_m, delta_y_m)
+                target_reached_m = assignment_waypoint_reached_distance(
+                    assignment_route,
+                    assignment_route_index,
+                )
 
-                if target_distance_m <= ASSIGNMENT_TARGET_REACHED_M:
+                if target_distance_m <= target_reached_m:
                     assignment_route_index += 1
                     if assignment_route_index >= len(assignment_route):
                         assignment_target_reached = True
@@ -968,6 +1078,7 @@ def run():
                         robot_theta_rad,
                         target_x_m,
                         target_y_m,
+                        "assignment",
                     )
 
         coverage_left_speed = None
@@ -999,6 +1110,7 @@ def run():
                     robot_theta_rad,
                     target_x_m,
                     target_y_m,
+                    "coverage",
                 )
 
         # Check for obstacles on each side

@@ -28,6 +28,13 @@ ROBOT_DEF_NAMES = {
     "epuck_3": "EPUCK_3",
     "epuck_4": "EPUCK_4",
 }
+ROBOT_START_POSES = {
+    "epuck_1": (-1.5, 0.0, 0.5 * math.pi),
+    "epuck_2": (-0.5, 0.0, 0.5 * math.pi),
+    "epuck_3": (0.5, 0.0, -0.5 * math.pi),
+    "epuck_4": (1.5, 0.0, -0.5 * math.pi),
+}
+ROBOT_START_Z_M = -0.000031
 # Assignment is already gated on every robot finishing its launch waypoints,
 # so we don't need an extra time floor — run MRTA the moment launches complete.
 MRTA_ASSIGNMENT_DELAY_STEPS = 0
@@ -98,6 +105,7 @@ WALL_SCORE_THRESHOLD = 3
 HUB_ROUTE_WAYPOINT = [0.0, 0.0]
 ROOM_DOORWAY_INSIDE_OFFSET_M = 0.18
 ROOM_DOORWAY_HUB_OFFSET_M = 0.18
+ROOM_DOORWAY_ALIGNMENT_OFFSET_M = 0.45
 
 ROOM_TASKS = {
     "nw_small": {
@@ -176,6 +184,25 @@ def room_doorway_waypoints(room):
         wall_y_m = max_y
         inside_y_m = wall_y_m - ROOM_DOORWAY_INSIDE_OFFSET_M
         hub_y_m = wall_y_m + ROOM_DOORWAY_HUB_OFFSET_M
+
+    return [round(center_x_m, 3), round(inside_y_m, 3)], [
+        round(center_x_m, 3),
+        round(hub_y_m, 3),
+    ]
+
+
+def room_doorway_alignment_waypoints(room):
+    """Return doorway centerline points that line a robot up before crossing."""
+    center_x_m, center_y_m = ROOM_TASKS[room]["center"]
+    _, _, min_y, max_y = ROOM_TASKS[room]["bounds"]
+    if center_y_m > 0.0:
+        wall_y_m = min_y
+        inside_y_m = wall_y_m + ROOM_DOORWAY_ALIGNMENT_OFFSET_M
+        hub_y_m = wall_y_m - ROOM_DOORWAY_ALIGNMENT_OFFSET_M
+    else:
+        wall_y_m = max_y
+        inside_y_m = wall_y_m - ROOM_DOORWAY_ALIGNMENT_OFFSET_M
+        hub_y_m = wall_y_m + ROOM_DOORWAY_ALIGNMENT_OFFSET_M
 
     return [round(center_x_m, 3), round(inside_y_m, 3)], [
         round(center_x_m, 3),
@@ -354,16 +381,29 @@ def generate_assignment_route(pose, target_room, final_waypoint=None):
 
     if current_room is not None and current_room != target_room:
         current_inside, current_hub = room_doorway_waypoints(current_room)
+        current_inside_approach, current_hub_approach = (
+            room_doorway_alignment_waypoints(current_room)
+        )
+        append_route_waypoint(route, current_inside_approach)
         append_route_waypoint(route, current_inside)
         append_route_waypoint(route, current_hub)
-        for waypoint in shortest_hub_route_waypoints(current_room, target_room)[1:]:
+        append_route_waypoint(route, current_hub_approach)
+        hub_waypoints = shortest_hub_route_waypoints(current_room, target_room)[1:]
+        for waypoint_index, waypoint in enumerate(hub_waypoints):
+            if waypoint_index == len(hub_waypoints) - 1:
+                _, target_hub_approach = room_doorway_alignment_waypoints(target_room)
+                append_route_waypoint(route, target_hub_approach)
             append_route_waypoint(route, waypoint)
     else:
         _, target_hub = room_doorway_waypoints(target_room)
+        _, target_hub_approach = room_doorway_alignment_waypoints(target_room)
+        append_route_waypoint(route, target_hub_approach)
         append_route_waypoint(route, target_hub)
 
     target_inside, _ = room_doorway_waypoints(target_room)
+    target_inside_approach, _ = room_doorway_alignment_waypoints(target_room)
     append_route_waypoint(route, target_inside)
+    append_route_waypoint(route, target_inside_approach)
     append_route_waypoint(route, target_point)
     return route
 
@@ -384,11 +424,22 @@ def generate_route_to_room_hub(pose, target_room, final_waypoint=None):
     current_room = room_for_pose(pose)
     if current_room is not None and current_room != target_room:
         current_inside, current_hub = room_doorway_waypoints(current_room)
+        current_inside_approach, current_hub_approach = (
+            room_doorway_alignment_waypoints(current_room)
+        )
+        append_route_waypoint(route, current_inside_approach)
         append_route_waypoint(route, current_inside)
         append_route_waypoint(route, current_hub)
-        for waypoint in shortest_hub_route_waypoints(current_room, target_room)[1:]:
+        append_route_waypoint(route, current_hub_approach)
+        hub_waypoints = shortest_hub_route_waypoints(current_room, target_room)[1:]
+        for waypoint_index, waypoint in enumerate(hub_waypoints):
+            if waypoint_index == len(hub_waypoints) - 1:
+                _, target_hub_approach = room_doorway_alignment_waypoints(target_room)
+                append_route_waypoint(route, target_hub_approach)
             append_route_waypoint(route, waypoint)
     elif current_room is None:
+        _, target_hub_approach = room_doorway_alignment_waypoints(target_room)
+        append_route_waypoint(route, target_hub_approach)
         append_route_waypoint(route, target_hub)
 
     append_route_waypoint(route, target_point)
@@ -572,6 +623,17 @@ def point_inside_any_bounds(point, bounds_list):
     return any(point_inside_bounds(point, bounds) for bounds in bounds_list)
 
 
+def points_share_no_go_bounds(first_point, second_point, no_go_bounds):
+    """Return True when two points sit inside the same no-go rectangle."""
+    if first_point is None or second_point is None:
+        return False
+    return any(
+        point_inside_bounds(first_point, bounds)
+        and point_inside_bounds(second_point, bounds)
+        for bounds in no_go_bounds
+    )
+
+
 def room_entry_blocked_by_no_go_zones(room, no_go_zones=None):
     """Return True when an operator no-go zone blocks the room doorway."""
     if not no_go_zones or room not in ROOM_TASKS:
@@ -688,7 +750,12 @@ def route_segment_around_no_go_zones(start_point, end_point, no_go_bounds):
     return [candidates[index] for index in path_indexes[1:]]
 
 
-def route_around_no_go_zones(route, no_go_zones=None, start_point=None):
+def route_around_no_go_zones(
+    route,
+    no_go_zones=None,
+    start_point=None,
+    allow_initial_blocked_waypoints=False,
+):
     """Return a route with extra waypoints inserted around operator no-go zones."""
     if not no_go_zones:
         return list(route)
@@ -708,6 +775,13 @@ def route_around_no_go_zones(route, no_go_zones=None, start_point=None):
             continue
         target_point = [round(float(waypoint[0]), 3), round(float(waypoint[1]), 3)]
         if point_inside_any_bounds(target_point, no_go_bounds):
+            if (
+                allow_initial_blocked_waypoints
+                and points_share_no_go_bounds(previous_point, target_point, no_go_bounds)
+            ):
+                append_route_waypoint(adjusted_route, target_point)
+                previous_point = target_point
+                continue
             break
 
         if previous_point is None:
@@ -1514,6 +1588,20 @@ def generate_coverage_waypoints(room, lane_index=0, lane_count=1):
     return waypoints
 
 
+def cleanup_waypoint_for_tile_center(room, tile_center):
+    """Return a reachable robot waypoint that can clean one dirty tile."""
+    min_x, max_x, min_y, max_y = ROOM_TASKS[room]["bounds"]
+    target_x = min(
+        max(float(tile_center[0]), min_x + COVERAGE_MARGIN_M),
+        max_x - COVERAGE_MARGIN_M,
+    )
+    target_y = min(
+        max(float(tile_center[1]), min_y + COVERAGE_MARGIN_M),
+        max_y - COVERAGE_MARGIN_M,
+    )
+    return [round(target_x, 3), round(target_y, 3)]
+
+
 def room_robot_names(room_assignments, room):
     """Return robots currently assigned to one room in a stable order."""
     return sorted(
@@ -1581,6 +1669,43 @@ def get_actual_robot_pose(supervisor, robot_name):
         pose["theta_rad"] = normalize_angle(theta_rad)
 
     return pose
+
+
+def reset_webots_robot_poses(supervisor):
+    """Move each robot back to its initial world pose without reloading Webots."""
+    reset_count = 0
+    for robot_name, def_name in ROBOT_DEF_NAMES.items():
+        robot_node = supervisor.getFromDef(def_name)
+        start_pose = ROBOT_START_POSES.get(robot_name)
+        if robot_node is None or start_pose is None:
+            continue
+
+        x_m, y_m, theta_rad = start_pose
+        translation_field = robot_node.getField("translation")
+        if translation_field is not None:
+            translation_field.setSFVec3f([x_m, y_m, ROBOT_START_Z_M])
+
+        rotation_field = robot_node.getField("rotation")
+        if rotation_field is not None:
+            rotation_field.setSFRotation([0.0, 0.0, 1.0, theta_rad])
+
+        reset_physics = getattr(robot_node, "resetPhysics", None)
+        if callable(reset_physics):
+            reset_physics()
+        reset_count += 1
+    return reset_count
+
+
+def send_sim_reset_command(emitter):
+    """Tell every robot controller to clear local state for a dashboard reset."""
+    emitter.send(
+        json.dumps(
+            {
+                "type": "sim_reset",
+                "robot": "all",
+            }
+        )
+    )
 
 
 def pose_error(status_pose, reference_pose):
@@ -2174,14 +2299,25 @@ def default_operator_state_snapshot():
     }
 
 
-def reset_operator_control_file(control_path):
+def reset_operator_control_file(control_path, preserve_zones=False):
     """Clear stale operator commands when the Webots simulation starts over."""
     path = Path(control_path)
+    preserved_config = default_operator_control_config()
+    if preserve_zones and path.exists():
+        try:
+            parsed = parse_operator_control_config(
+                json.loads(path.read_text(encoding="utf-8"))
+            )
+            preserved_config["priority_zones"] = parsed["priority_zones"]
+            preserved_config["no_go_zones"] = parsed["no_go_zones"]
+        except (OSError, json.JSONDecodeError):
+            pass
+
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         temp_path = path.with_suffix(path.suffix + ".tmp")
         temp_path.write_text(
-            json.dumps(default_operator_control_config(), indent=2) + "\n",
+            json.dumps(preserved_config, indent=2) + "\n",
             encoding="utf-8",
         )
         temp_path.replace(path)
@@ -2451,6 +2587,7 @@ def cleanup_trigger_reason(
     room_stalled=False,
     no_go_zones=None,
     exclude_entry_blocked=True,
+    cleanup_robot_count=1,
 ):
     """Return why a robot should switch from sweep to cleanup, or None."""
     dirty_count = cleaning_overlay.dirty_tile_count(
@@ -2470,10 +2607,21 @@ def cleanup_trigger_reason(
         return f"sweep complete; {dirty_count} dirty tile(s) remain"
     if dirty_count <= FINAL_CLEANUP_DIRTY_TILE_COUNT:
         return f"final {dirty_count} dirty tile(s) remain"
+    cleanup_capacity = max(
+        FINAL_CLEANUP_DIRTY_TILE_COUNT,
+        CLEANUP_TARGETS_PER_ROBOT * max(1, cleanup_robot_count),
+    )
+    if cleanup_robot_count > 1 and dirty_count <= cleanup_capacity:
+        return (
+            f"{dirty_count} dirty tile(s) fit "
+            f"{max(1, cleanup_robot_count)} cleanup robot(s)"
+        )
     if progress_percent >= FINAL_CLEANUP_PROGRESS_PERCENT:
         return f"room is {progress_percent:.1f}% clean"
     if room_stalled and progress_percent >= STALLED_CLEANUP_PROGRESS_PERCENT:
         return f"room stalled at {progress_percent:.1f}% clean"
+    if dirty_count <= CLEANUP_TARGETS_PER_ROBOT:
+        return f"{dirty_count} dirty tile(s) fit one cleanup robot"
 
     return None
 
@@ -3276,12 +3424,20 @@ def select_robot_for_stalled_room(
     excluded_robots=None,
     latest_robot_status=None,
     no_go_zones=None,
+    reserved_assignments=None,
 ):
     """Pick a robot that can be redirected to a stalled room without abandoning work."""
     if excluded_robots is None:
         excluded_robots = set()
     if latest_robot_status is None:
         latest_robot_status = {}
+
+    if not room_has_active_capacity(
+        room_assignments,
+        stalled_room,
+        reserved_assignments=reserved_assignments,
+    ):
+        return None
 
     idle_candidates = []
     for robot_name in EXPECTED_ROBOTS:
@@ -3353,17 +3509,86 @@ def target_robot_count_for_room(room):
     Small rooms are like a small bedroom: one robot is usually enough before
     larger rooms get help. Medium and large rooms can use two robots sooner.
     """
-    area_m2 = ROOM_TASKS[room]["area_m2"]
-    if area_m2 <= ROOM_TASKS["nw_small"]["area_m2"] + 1e-9:
+    if room_is_small(room):
         return SMALL_ROOM_MAX_PRIMARY_ROBOTS
     return LARGE_ROOM_MAX_PRIMARY_ROBOTS
 
 
-def active_robot_count(room_assignments, room):
+def late_helper_robot_count_for_room(room):
+    """Return the most robots allowed when only already-staffed work remains."""
+    return target_robot_count_for_room(room)
+
+
+def room_is_small(room):
+    """Return True when a room is too small to benefit from extra robots."""
+    area_m2 = ROOM_TASKS[room]["area_m2"]
+    return area_m2 <= ROOM_TASKS["nw_small"]["area_m2"] + 1e-9
+
+
+def room_assignments_with_reserved_tasks(room_assignments, reserved_assignments=None):
+    """Return active assignments plus paused tasks that still reserve a room."""
+    combined_assignments = dict(room_assignments)
+    if reserved_assignments is None:
+        return combined_assignments
+
+    for robot_name, assignment in reserved_assignments.items():
+        if assignment is not None and combined_assignments.get(robot_name) is None:
+            combined_assignments[robot_name] = assignment
+    return combined_assignments
+
+
+def active_robot_count(
+    room_assignments,
+    room,
+    ignored_robot=None,
+    reserved_assignments=None,
+):
     """Return how many robots are currently assigned to one room."""
+    assignment_pool = room_assignments_with_reserved_tasks(
+        room_assignments,
+        reserved_assignments,
+    )
     return sum(
-        1 for assignment in room_assignments.values()
-        if assignment is not None and assignment["room"] == room
+        1 for robot_name, assignment in assignment_pool.items()
+        if (
+            robot_name != ignored_robot
+            and assignment is not None
+            and assignment["room"] == room
+        )
+    )
+
+
+def room_has_active_capacity(
+    room_assignments,
+    room,
+    ignored_robot=None,
+    reserved_assignments=None,
+):
+    """Return True when one more active robot can work without crowding."""
+    return (
+        active_robot_count(
+            room_assignments,
+            room,
+            ignored_robot,
+            reserved_assignments,
+        )
+        < target_robot_count_for_room(room)
+    )
+
+
+def operator_redirect_has_capacity(
+    room_assignments,
+    robot_name,
+    next_room,
+    previous_room=None,
+    reserved_assignments=None,
+):
+    """Return True when an operator redirect will not overcrowd a room."""
+    return room_has_active_capacity(
+        room_assignments,
+        next_room,
+        ignored_robot=robot_name,
+        reserved_assignments=reserved_assignments,
     )
 
 
@@ -3373,10 +3598,15 @@ def unfinished_rooms_below_target(
     cleaning_overlay,
     ignored_robot=None,
     no_go_zones=None,
+    reserved_assignments=None,
 ):
     """Return unfinished rooms that have fewer robots than their normal target."""
+    assignment_pool = room_assignments_with_reserved_tasks(
+        room_assignments,
+        reserved_assignments,
+    )
     active_room_counts = {}
-    for robot, assignment in room_assignments.items():
+    for robot, assignment in assignment_pool.items():
         if robot == ignored_robot or assignment is None:
             continue
         room = assignment["room"]
@@ -3416,6 +3646,7 @@ def select_reassignment_room(
     progress_monitors=None,
     priority_zones=None,
     no_go_zones=None,
+    reserved_assignments=None,
 ):
     """
     Pick the unfinished room that most needs help.
@@ -3434,11 +3665,18 @@ def select_reassignment_room(
         progress_monitors = {}
 
     active_room_counts = {}
-    for robot, assignment in room_assignments.items():
+    reserved_room_counts = {}
+    assignment_pool = room_assignments_with_reserved_tasks(
+        room_assignments,
+        reserved_assignments,
+    )
+    for robot, assignment in assignment_pool.items():
         if robot == robot_name or assignment is None:
             continue
         room = assignment["room"]
         active_room_counts[room] = active_room_counts.get(room, 0) + 1
+        if room_assignments.get(robot) is None:
+            reserved_room_counts[room] = reserved_room_counts.get(room, 0) + 1
 
     preferred_rooms = unfinished_rooms_below_target(
         room_assignments,
@@ -3446,6 +3684,7 @@ def select_reassignment_room(
         cleaning_overlay,
         ignored_robot=robot_name,
         no_go_zones=no_go_zones,
+        reserved_assignments=reserved_assignments,
     )
     preferred_rooms = [
         room
@@ -3463,8 +3702,13 @@ def select_reassignment_room(
         )
     ]
     candidate_rooms = []
+    late_helper_rooms = []
     for room in ROOM_TASKS:
         if room == current_room or room in completed_rooms:
+            continue
+        dirty_count = cleaning_overlay.dirty_tile_count(room, no_go_zones)
+        active_count = active_room_counts.get(room, 0)
+        if active_count > 0 and dirty_count < FINAL_CLEANUP_DIRTY_TILE_COUNT:
             continue
         progress_percent = cleaning_overlay.room_progress_percent(room, no_go_zones)
         if progress_percent >= COVERAGE_COMPLETE_PERCENT:
@@ -3472,7 +3716,15 @@ def select_reassignment_room(
         if preferred_rooms and room not in preferred_rooms:
             continue
         target_count = target_robot_count_for_room(room)
-        active_count = active_room_counts.get(room, 0)
+        late_helper = False
+        if active_count >= target_count:
+            if (
+                preferred_rooms
+                or active_count >= late_helper_robot_count_for_room(room)
+                or (room_is_small(room) and reserved_room_counts.get(room, 0) > 0)
+            ):
+                continue
+            late_helper = True
         support_ratio = active_count / target_count
         progress_rate = room_progress_rate(progress_monitors, room)
         route_distance = route_cost_to_room(
@@ -3491,7 +3743,7 @@ def select_reassignment_room(
             - MRTA_DIRTY_PERCENT_WEIGHT * dirty_percent
             - OPERATOR_PRIORITY_ROUTE_WEIGHT * priority_weight
         )
-        candidate_rooms.append((
+        candidate = (
             support_ratio,
             score,
             -priority_weight,
@@ -3499,8 +3751,14 @@ def select_reassignment_room(
             progress_percent,
             route_distance,
             room,
-        ))
+        )
+        if late_helper:
+            late_helper_rooms.append(candidate)
+        else:
+            candidate_rooms.append(candidate)
 
+    if not candidate_rooms:
+        candidate_rooms = late_helper_rooms
     if not candidate_rooms:
         return None
 
@@ -3519,6 +3777,7 @@ def select_stuck_recovery_room(
     priority_zones=None,
     no_go_zones=None,
     robot_inside_room=False,
+    reserved_assignments=None,
 ):
     """Choose whether a stuck robot should retry its room or help elsewhere."""
     assignment = room_assignments.get(robot_name)
@@ -3553,6 +3812,7 @@ def select_stuck_recovery_room(
         progress_monitors,
         priority_zones,
         no_go_zones,
+        reserved_assignments,
     )
     if fallback_room is not None:
         return fallback_room
@@ -3644,6 +3904,7 @@ def prepare_assignment_for_dispatch(
         route,
         no_go_zones,
         start_point=pose_point(pose),
+        allow_initial_blocked_waypoints=True,
     )
     if (
         no_go_zones
@@ -3652,7 +3913,11 @@ def prepare_assignment_for_dispatch(
         and (not route or route[-1] != route_target)
     ):
         coverage_plan = []
-        route_target = route[-1] if route else pose_point(pose)
+        route_target = route[-1] if route else route_target_for_empty_coverage(
+            assignment["room"],
+            no_go_zones,
+            pose,
+        )
         route = [route_target] if route_target is not None and not route else route
 
     planned_distance_m = route_distance_m(pose, route)
@@ -3821,6 +4086,352 @@ def send_room_coverage_plans(
     return coverage_plans
 
 
+def status_pose_inside_room(status, room):
+    """Return True when a robot status reports the robot inside one room."""
+    if not isinstance(status, dict):
+        return False
+    pose = status.get("pose")
+    return pose is not None and room_for_pose(pose) == room
+
+
+def assignment_route_needs_refresh(status, assignment, pose):
+    """Return True when route constraints changed before the robot is in-room."""
+    if not isinstance(status, dict) or assignment is None:
+        return False
+    if not status.get("assignment_target_reached", False):
+        return True
+    return room_for_pose(pose) != assignment["room"]
+
+
+def room_has_status_robot_inside(latest_robot_status, room_assignments, room):
+    """Return True when any assigned robot status is already inside the room."""
+    if not isinstance(latest_robot_status, dict):
+        return False
+    return any(
+        status_pose_inside_room(latest_robot_status.get(robot_name), room)
+        for robot_name in room_robot_names(room_assignments, room)
+    )
+
+
+def room_has_completed_sweep_status(latest_robot_status, room_assignments, room):
+    """Return True when any assigned robot reports a finished sweep for the room."""
+    if not isinstance(latest_robot_status, dict):
+        return False
+    for robot_name in room_robot_names(room_assignments, room):
+        status = latest_robot_status.get(robot_name)
+        if not isinstance(status, dict):
+            continue
+        coverage = status.get("coverage", {})
+        if (
+            coverage.get("room") == room
+            and coverage.get("complete", False)
+            and coverage.get("plan_kind", "sweep") == "sweep"
+        ):
+            return True
+    return False
+
+
+def room_cleanup_completed_by_all(latest_robot_status, room_assignments, room):
+    """Return True when every robot in one room finished a cleanup plan."""
+    robot_names = room_robot_names(room_assignments, room)
+    if not robot_names or not isinstance(latest_robot_status, dict):
+        return False
+
+    for robot_name in robot_names:
+        status = latest_robot_status.get(robot_name)
+        if not isinstance(status, dict):
+            return False
+        coverage = status.get("coverage", {})
+        if (
+            coverage.get("room") != room
+            or not coverage.get("complete", False)
+            or coverage.get("plan_kind") != "cleanup"
+        ):
+            return False
+    return True
+
+
+def send_room_cleanup_retry_if_all_done(
+    emitter,
+    room_assignments,
+    room,
+    cleaning_overlay,
+    cleanup_plan_signatures,
+    cleanup_plan_steps,
+    step_count,
+    reason,
+    no_go_zones=None,
+    latest_robot_status=None,
+):
+    """Retry room cleanup when finished cleanup plans left dirt behind."""
+    if not room_cleanup_completed_by_all(latest_robot_status, room_assignments, room):
+        return {}
+
+    for robot_name in room_robot_names(room_assignments, room):
+        cleanup_plan_signatures.pop(robot_name, None)
+        cleanup_plan_steps.pop(robot_name, None)
+    cleaning_overlay.release_room_claims(room)
+    return send_room_cleanup_plans(
+        emitter,
+        room_assignments,
+        room,
+        cleaning_overlay,
+        cleanup_plan_signatures,
+        cleanup_plan_steps,
+        step_count,
+        reason,
+        no_go_zones,
+        latest_robot_status,
+    )
+
+
+def cleanup_robot_names_for_room(
+    robot_names,
+    latest_robot_status,
+    cleaning_overlay,
+    room,
+    no_go_zones=None,
+    room_assignments=None,
+):
+    """Choose which robots should move during this room cleanup pass."""
+    if len(robot_names) <= 1:
+        return list(robot_names)
+
+    dirty_count = cleaning_overlay.dirty_tile_count(room, no_go_zones)
+    if dirty_count >= FINAL_CLEANUP_DIRTY_TILE_COUNT:
+        return list(robot_names)
+
+    dirty_centers = [
+        center for center in cleaning_overlay.dirty_tile_centers(room)
+        if not point_blocked_by_no_go_zones(center, no_go_zones)
+    ]
+    if not dirty_centers:
+        return list(robot_names)
+
+    if room_assignments is None:
+        room_assignments = {}
+    primary_robot_names = [
+        robot_name for robot_name in robot_names
+        if not room_assignments.get(robot_name, {}).get("helper", False)
+    ]
+    candidate_robot_names = primary_robot_names or robot_names
+
+    def distance_to_dirty(robot_name):
+        status = (
+            latest_robot_status.get(robot_name)
+            if isinstance(latest_robot_status, dict)
+            else None
+        )
+        pose = status.get("pose") if isinstance(status, dict) else None
+        if pose is None:
+            return (float("inf"), robot_name)
+        nearest_distance = min(
+            math.hypot(center[0] - pose["x_m"], center[1] - pose["y_m"])
+            for center in dirty_centers
+        )
+        return (nearest_distance, robot_name)
+
+    return [min(candidate_robot_names, key=distance_to_dirty)]
+
+
+def retry_completed_cleanup_rooms(
+    emitter,
+    room_assignments,
+    completed_rooms,
+    cleaning_overlay,
+    cleanup_plan_signatures,
+    cleanup_plan_steps,
+    step_count,
+    no_go_zones=None,
+    latest_robot_status=None,
+):
+    """Restart room cleanup when every assigned robot has stopped too early."""
+    retried_rooms = set()
+    coverage_plans = {}
+    for room in ROOM_TASKS:
+        if room in completed_rooms:
+            continue
+        dirty_count = cleaning_overlay.dirty_tile_count(room, no_go_zones)
+        if dirty_count <= 0:
+            continue
+        retry_plans = send_room_cleanup_retry_if_all_done(
+            emitter,
+            room_assignments,
+            room,
+            cleaning_overlay,
+            cleanup_plan_signatures,
+            cleanup_plan_steps,
+            step_count,
+            f"completed cleanup left {dirty_count} dirty tile(s)",
+            no_go_zones,
+            latest_robot_status,
+        )
+        if not retry_plans:
+            continue
+        coverage_plans.update(retry_plans)
+        retried_rooms.add(room)
+        print(
+            f"[supervisor] Retrying cleanup for {room}; "
+            f"{dirty_count} dirty tile(s) remain after completed plans"
+        )
+
+    return retried_rooms, coverage_plans
+
+
+def send_room_cleanup_plans(
+    emitter,
+    room_assignments,
+    room,
+    cleaning_overlay,
+    cleanup_plan_signatures,
+    cleanup_plan_steps,
+    step_count,
+    reason,
+    no_go_zones=None,
+    latest_robot_status=None,
+):
+    """Send targeted cleanup claims to every robot assigned to one room."""
+    coverage_plans = {}
+    robot_names = room_robot_names(room_assignments, room)
+    for robot_name in robot_names:
+        cleanup_plan_signatures.pop(robot_name, None)
+        cleanup_plan_steps.pop(robot_name, None)
+        if hasattr(cleaning_overlay, "release_robot_room_claims"):
+            cleaning_overlay.release_robot_room_claims(robot_name, room)
+        else:
+            cleaning_overlay.release_robot_claims(robot_name)
+
+    moving_robot_names = set(
+        cleanup_robot_names_for_room(
+            robot_names,
+            latest_robot_status,
+            cleaning_overlay,
+            room,
+            no_go_zones,
+            room_assignments,
+        )
+    )
+    for robot_name in robot_names:
+        if robot_name not in moving_robot_names:
+            empty_plan = send_empty_cleanup_plan_if_needed(
+                emitter,
+                robot_name,
+                room,
+                cleanup_plan_signatures,
+                cleanup_plan_steps,
+                step_count,
+            )
+            if empty_plan is not None:
+                coverage_plans[robot_name] = empty_plan
+            continue
+
+        status = (
+            latest_robot_status.get(robot_name)
+            if isinstance(latest_robot_status, dict)
+            else None
+        )
+        pose = status.get("pose") if isinstance(status, dict) else None
+        robot_inside_room = pose is not None and room_for_pose(pose) == room
+        cleanup_plan = send_cleanup_plan_if_needed(
+            emitter,
+            cleaning_overlay,
+            robot_name,
+            room,
+            pose,
+            cleanup_plan_signatures,
+            cleanup_plan_steps,
+            step_count,
+            reason,
+            no_go_zones,
+            entry_blocked_is_reachable=robot_inside_room,
+        )
+        if cleanup_plan is not None:
+            coverage_plans[robot_name] = cleanup_plan
+            continue
+
+        empty_plan = send_empty_cleanup_plan_if_needed(
+            emitter,
+            robot_name,
+            room,
+            cleanup_plan_signatures,
+            cleanup_plan_steps,
+            step_count,
+        )
+        if empty_plan is not None:
+            coverage_plans[robot_name] = empty_plan
+
+    return coverage_plans
+
+
+def send_room_work_plans(
+    emitter,
+    room_assignments,
+    room,
+    cleaning_overlay=None,
+    cleanup_plan_signatures=None,
+    cleanup_plan_steps=None,
+    no_go_zones=None,
+    latest_robot_status=None,
+    step_count=0,
+):
+    """Send either normal sweep lanes or targeted cleanup claims for a room."""
+    if (
+        cleaning_overlay is None
+        or cleanup_plan_signatures is None
+        or cleanup_plan_steps is None
+        or not hasattr(cleaning_overlay, "claim_dirty_tile_centers")
+    ):
+        return send_room_coverage_plans(
+            emitter,
+            room_assignments,
+            room,
+            cleaning_overlay,
+            cleanup_plan_signatures,
+            cleanup_plan_steps,
+            no_go_zones,
+            latest_robot_status,
+        )
+
+    robot_names = room_robot_names(room_assignments, room)
+    room_has_inside_robot = room_has_status_robot_inside(
+        latest_robot_status,
+        room_assignments,
+        room,
+    )
+    cleanup_reason = cleanup_trigger_reason(
+        cleaning_overlay,
+        room,
+        room_has_completed_sweep_status(latest_robot_status, room_assignments, room),
+        no_go_zones=no_go_zones,
+        exclude_entry_blocked=not room_has_inside_robot,
+        cleanup_robot_count=len(robot_names),
+    )
+    if cleanup_reason is not None:
+        return send_room_cleanup_plans(
+            emitter,
+            room_assignments,
+            room,
+            cleaning_overlay,
+            cleanup_plan_signatures,
+            cleanup_plan_steps,
+            step_count,
+            cleanup_reason,
+            no_go_zones,
+            latest_robot_status,
+        )
+
+    return send_room_coverage_plans(
+        emitter,
+        room_assignments,
+        room,
+        cleaning_overlay,
+        cleanup_plan_signatures,
+        cleanup_plan_steps,
+        no_go_zones,
+        latest_robot_status,
+    )
+
+
 def send_recovery_command(emitter, robot_name, reason):
     """Ask one robot to back up and turn before trying its route again."""
     emitter.send(
@@ -3852,6 +4463,7 @@ def assign_idle_robots_to_unfinished_rooms(
     step_count=0,
     priority_zones=None,
     no_go_zones=None,
+    operator_paused_assignments=None,
 ):
     """Send idle robots back to rooms that became unfinished again."""
     assigned_rooms = {}
@@ -3873,6 +4485,7 @@ def assign_idle_robots_to_unfinished_rooms(
             latest_robot_status,
             priority_zones=priority_zones,
             no_go_zones=no_go_zones,
+            reserved_assignments=operator_paused_assignments,
         )
         if next_room is None:
             continue
@@ -3897,7 +4510,7 @@ def assign_idle_robots_to_unfinished_rooms(
             no_go_zones=no_go_zones,
         )
         coverage_plans.update(
-            send_room_coverage_plans(
+            send_room_work_plans(
                 emitter,
                 room_assignments,
                 next_room,
@@ -3906,6 +4519,7 @@ def assign_idle_robots_to_unfinished_rooms(
                 cleanup_plan_steps,
                 no_go_zones,
                 latest_robot_status,
+                step_count,
             )
         )
         assigned_rooms[robot_name] = next_room
@@ -3930,6 +4544,7 @@ def handle_operator_no_go_change(
     step_count=0,
     priority_zones=None,
     no_go_zones=None,
+    operator_paused_assignments=None,
 ):
     """Refresh reachable work after the operator changes no-go zones."""
     reopened_rooms = reopen_completed_rooms_with_reachable_dirt(
@@ -3957,6 +4572,7 @@ def handle_operator_no_go_change(
         step_count,
         priority_zones,
         no_go_zones,
+        operator_paused_assignments,
     )
     return reopened_rooms, assigned_idle_rooms
 
@@ -3983,8 +4599,15 @@ def send_cleanup_plan_if_needed(
         no_go_zones=no_go_zones,
         entry_blocked_is_reachable=entry_blocked_is_reachable,
     )
+    cleanup_targets = [
+        (
+            center,
+            cleanup_waypoint_for_tile_center(room, center),
+        )
+        for center in claimed_cleanup_plan
+    ]
     cleanup_plan = coverage_plan_around_no_go_zones(
-        claimed_cleanup_plan,
+        [waypoint for _, waypoint in cleanup_targets],
         no_go_zones,
         start_point=pose_point(pose),
     )
@@ -3995,8 +4618,8 @@ def send_cleanup_plan_if_needed(
             if isinstance(waypoint, (list, tuple)) and len(waypoint) == 2
         }
         reachable_claim_centers = [
-            center for center in claimed_cleanup_plan
-            if tuple(round(float(coordinate), 3) for coordinate in center)
+            center for center, waypoint in cleanup_targets
+            if tuple(round(float(coordinate), 3) for coordinate in waypoint)
             in cleanup_waypoint_keys
         ]
         cleaning_overlay.release_robot_room_claims_except_centers(
@@ -4035,6 +4658,70 @@ def send_cleanup_plan_if_needed(
     return cleanup_plan
 
 
+def send_empty_cleanup_plan_if_needed(
+    emitter,
+    robot_name,
+    room,
+    cleanup_plan_signatures,
+    cleanup_plan_steps,
+    step_count,
+):
+    """Send an empty cleanup plan so a robot with no claim stops roaming."""
+    cleanup_signature = (room, ())
+    previous_step = cleanup_plan_steps.get(robot_name)
+    resend_due = (
+        previous_step is not None
+        and step_count - previous_step >= CLEANUP_RESEND_STEPS
+    )
+    if cleanup_plan_signatures.get(robot_name) == cleanup_signature and not resend_due:
+        return None
+
+    cleanup_plan_steps[robot_name] = step_count
+    cleanup_plan_signatures[robot_name] = cleanup_signature
+    send_coverage_plan(
+        emitter,
+        robot_name,
+        room,
+        [],
+        plan_kind="cleanup",
+    )
+    return []
+
+
+def has_active_cleanup_plan(cleanup_plan_signatures, robot_name, room):
+    """Return True when this robot already has non-empty cleanup targets."""
+    cleanup_signature = cleanup_plan_signatures.get(robot_name)
+    return (
+        isinstance(cleanup_signature, tuple)
+        and len(cleanup_signature) == 2
+        and cleanup_signature[0] == room
+        and bool(cleanup_signature[1])
+    )
+
+
+def reset_completed_cleanup_plan_if_dirty(
+    robot_name,
+    room,
+    coverage,
+    cleaning_overlay,
+    cleanup_plan_signatures,
+    cleanup_plan_steps,
+):
+    """Clear a finished cleanup target so remaining dirt gets a fresh pass."""
+    if (
+        coverage.get("room") != room
+        or not coverage.get("complete", False)
+        or coverage.get("plan_kind") != "cleanup"
+        or not has_active_cleanup_plan(cleanup_plan_signatures, robot_name, room)
+    ):
+        return False
+
+    cleanup_plan_signatures.pop(robot_name, None)
+    cleanup_plan_steps.pop(robot_name, None)
+    cleaning_overlay.release_robot_room_claims(robot_name, room)
+    return True
+
+
 def send_idle_command(emitter, robot_name):
     """Tell one robot to stop and wait for a future assignment."""
     emitter.send(
@@ -4056,7 +4743,7 @@ def run():
 
     repo_root = Path(__file__).resolve().parents[2]
     operator_control_path = repo_root / OPERATOR_CONTROL_FILE
-    reset_operator_control_file(operator_control_path)
+    reset_operator_control_file(operator_control_path, preserve_zones=True)
 
     global_grid = GlobalOccupancyGrid(world_size_m=6.0, cell_size_m=0.05)
     cleaning_overlay = CleaningOverlay(supervisor, ROOM_TASKS)
@@ -4179,7 +4866,12 @@ def run():
             operator_controls.load(step_count)
             operator_controls.update_visuals(step_count)
             clear_runtime_after_sim_reset()
-            supervisor.simulationReset()
+            send_sim_reset_command(emitter)
+            reset_count = reset_webots_robot_poses(supervisor)
+            print(
+                "[supervisor] Dashboard soft reset complete: "
+                f"{reset_count}/{len(EXPECTED_ROBOTS)} robot pose(s) restored"
+            )
             continue
 
         operator_no_go_signature = operator_zone_signature(operator_controls.no_go_zones)
@@ -4361,6 +5053,7 @@ def run():
                     step_count,
                     operator_controls.priority_zones,
                     operator_controls.no_go_zones,
+                    operator_paused_assignments,
                 )
                 if reopened_rooms:
                     print(
@@ -4377,7 +5070,12 @@ def run():
                     if robot_name in operator_paused_robots or assignment is None:
                         continue
                     status = latest_robot_status.get(robot_name)
-                    if status is None or status.get("assignment_target_reached", False):
+                    if status is None:
+                        continue
+                    pose = get_actual_robot_pose(supervisor, robot_name)
+                    if pose is None:
+                        pose = status.get("pose")
+                    if not assignment_route_needs_refresh(status, assignment, pose):
                         continue
                     send_assignment_commands(
                         emitter,
@@ -4402,7 +5100,7 @@ def run():
                 )
                 for room in refreshed_rooms:
                     coverage_plans.update(
-                        send_room_coverage_plans(
+                        send_room_work_plans(
                             emitter,
                             room_assignments,
                             room,
@@ -4411,6 +5109,7 @@ def run():
                             cleanup_plan_steps,
                             operator_controls.no_go_zones,
                             latest_robot_status,
+                            step_count,
                         )
                     )
                 print("[supervisor] Refreshed active routes and sweeps for operator no-go zone changes")
@@ -4430,6 +5129,20 @@ def run():
                 previous_room = None
                 if previous_assignment is not None:
                     previous_room = previous_assignment["room"]
+
+                if not operator_redirect_has_capacity(
+                    room_assignments,
+                    robot_name,
+                    next_room,
+                    previous_room,
+                    operator_paused_assignments,
+                ):
+                    operator_controls.mark_redirect_processed(redirect["id"])
+                    print(
+                        f"[supervisor] Ignored operator redirect for {robot_name} "
+                        f"to {next_room}; small room already has an active robot"
+                    )
+                    continue
 
                 cleaning_overlay.release_robot_claims(robot_name)
                 cleanup_plan_signatures.pop(robot_name, None)
@@ -4471,7 +5184,7 @@ def run():
                     no_go_zones=operator_controls.no_go_zones,
                 )
                 coverage_plans.update(
-                    send_room_coverage_plans(
+                    send_room_work_plans(
                         emitter,
                         room_assignments,
                         next_room,
@@ -4480,11 +5193,12 @@ def run():
                         cleanup_plan_steps,
                         operator_controls.no_go_zones,
                         latest_robot_status,
+                        step_count,
                     )
                 )
                 if previous_room is not None and previous_room != next_room:
                     coverage_plans.update(
-                        send_room_coverage_plans(
+                        send_room_work_plans(
                             emitter,
                             room_assignments,
                             previous_room,
@@ -4493,6 +5207,7 @@ def run():
                             cleanup_plan_steps,
                             operator_controls.no_go_zones,
                             latest_robot_status,
+                            step_count,
                         )
                     )
 
@@ -4550,7 +5265,7 @@ def run():
                         no_go_zones=operator_controls.no_go_zones,
                     )
                     coverage_plans.update(
-                        send_room_coverage_plans(
+                        send_room_work_plans(
                             emitter,
                             room_assignments,
                             assignment["room"],
@@ -4559,6 +5274,7 @@ def run():
                             cleanup_plan_steps,
                             operator_controls.no_go_zones,
                             latest_robot_status,
+                            step_count,
                         )
                     )
                     robot_motion_monitors.pop(robot_name, None)
@@ -4566,6 +5282,43 @@ def run():
                         f"[supervisor] Operator resumed {robot_name} "
                         f"toward {assignment['room']}"
                     )
+
+            assigned_idle_rooms = assign_idle_robots_to_unfinished_rooms(
+                emitter,
+                room_assignments,
+                completed_rooms,
+                cleaning_overlay,
+                latest_robot_status,
+                operator_paused_robots,
+                coverage_plans,
+                cleanup_plan_signatures,
+                cleanup_plan_steps,
+                last_cleaning_poses,
+                robot_recovery_counts,
+                traffic_reservations,
+                step_count,
+                operator_controls.priority_zones,
+                operator_controls.no_go_zones,
+                operator_paused_assignments,
+            )
+            for robot_name, room in assigned_idle_rooms.items():
+                print(
+                    f"[supervisor] Reassigned idle {robot_name} "
+                    f"to available {room}"
+                )
+
+            cleanup_retry_rooms, cleanup_retry_plans = retry_completed_cleanup_rooms(
+                emitter,
+                room_assignments,
+                completed_rooms,
+                cleaning_overlay,
+                cleanup_plan_signatures,
+                cleanup_plan_steps,
+                step_count,
+                operator_controls.no_go_zones,
+                latest_robot_status,
+            )
+            coverage_plans.update(cleanup_retry_plans)
 
             for robot_name in EXPECTED_ROBOTS:
                 status = latest_robot_status.get(robot_name)
@@ -4605,6 +5358,7 @@ def run():
                     operator_controls.priority_zones,
                     operator_controls.no_go_zones,
                     robot_inside_room=room_for_pose(pose) == room,
+                    reserved_assignments=operator_paused_assignments,
                 )
                 if next_room is None:
                     continue
@@ -4631,7 +5385,7 @@ def run():
                     no_go_zones=operator_controls.no_go_zones,
                 )
                 coverage_plans.update(
-                    send_room_coverage_plans(
+                    send_room_work_plans(
                         emitter,
                         room_assignments,
                         next_room,
@@ -4640,12 +5394,13 @@ def run():
                         cleanup_plan_steps,
                         operator_controls.no_go_zones,
                         latest_robot_status,
+                        step_count,
                     )
                 )
                 if room != next_room:
                     robot_recovery_counts.pop(robot_name, None)
                     coverage_plans.update(
-                        send_room_coverage_plans(
+                        send_room_work_plans(
                             emitter,
                             room_assignments,
                             room,
@@ -4654,6 +5409,7 @@ def run():
                             cleanup_plan_steps,
                             operator_controls.no_go_zones,
                             latest_robot_status,
+                            step_count,
                         )
                     )
                 robot_motion_monitors.pop(robot_name, None)
@@ -4714,6 +5470,7 @@ def run():
                     excluded_robots=redirected_robots | operator_paused_robots,
                     latest_robot_status=latest_robot_status,
                     no_go_zones=operator_controls.no_go_zones,
+                    reserved_assignments=operator_paused_assignments,
                 )
                 if robot_to_redirect is None:
                     print(
@@ -4757,7 +5514,7 @@ def run():
                     no_go_zones=operator_controls.no_go_zones,
                 )
                 coverage_plans.update(
-                    send_room_coverage_plans(
+                    send_room_work_plans(
                         emitter,
                         room_assignments,
                         redirect_room,
@@ -4766,11 +5523,12 @@ def run():
                         cleanup_plan_steps,
                         operator_controls.no_go_zones,
                         latest_robot_status,
+                        step_count,
                     )
                 )
                 if previous_room != "idle" and previous_room != redirect_room:
                     coverage_plans.update(
-                        send_room_coverage_plans(
+                        send_room_work_plans(
                             emitter,
                             room_assignments,
                             previous_room,
@@ -4779,6 +5537,7 @@ def run():
                             cleanup_plan_steps,
                             operator_controls.no_go_zones,
                             latest_robot_status,
+                            step_count,
                         )
                     )
                 robot_motion_monitors.pop(robot_to_redirect, None)
@@ -4822,8 +5581,43 @@ def run():
                     room in stalled_room_set,
                     operator_controls.no_go_zones,
                     exclude_entry_blocked=not room_has_inside_robot,
+                    cleanup_robot_count=len(room_robot_names(room_assignments, room)),
                 )
                 if cleanup_reason is not None:
+                    if room in cleanup_retry_rooms:
+                        continue
+                    retry_plans = send_room_cleanup_retry_if_all_done(
+                        emitter,
+                        room_assignments,
+                        room,
+                        cleaning_overlay,
+                        cleanup_plan_signatures,
+                        cleanup_plan_steps,
+                        step_count,
+                        cleanup_reason,
+                        operator_controls.no_go_zones,
+                        latest_robot_status,
+                    )
+                    if retry_plans:
+                        coverage_plans.update(retry_plans)
+                        cleanup_retry_rooms.add(room)
+                        print(
+                            f"[supervisor] Retrying cleanup for {room}; "
+                            "dirty tiles remain after completed plans"
+                        )
+                        continue
+                    if reset_completed_cleanup_plan_if_dirty(
+                        robot_name,
+                        room,
+                        coverage,
+                        cleaning_overlay,
+                        cleanup_plan_signatures,
+                        cleanup_plan_steps,
+                    ):
+                        print(
+                            f"[supervisor] Refreshing cleanup target for "
+                            f"{robot_name} in {room}; dirty tiles remain"
+                        )
                     cleanup_plan = send_cleanup_plan_if_needed(
                         emitter,
                         cleaning_overlay,
@@ -4839,6 +5633,21 @@ def run():
                     )
                     if cleanup_plan is not None:
                         coverage_plans[robot_name] = cleanup_plan
+                    elif not has_active_cleanup_plan(
+                        cleanup_plan_signatures,
+                        robot_name,
+                        room,
+                    ):
+                        empty_plan = send_empty_cleanup_plan_if_needed(
+                            emitter,
+                            robot_name,
+                            room,
+                            cleanup_plan_signatures,
+                            cleanup_plan_steps,
+                            step_count,
+                        )
+                        if empty_plan is not None:
+                            coverage_plans[robot_name] = empty_plan
                     continue
 
                 if not room_reached_coverage_goal(
@@ -4878,6 +5687,7 @@ def run():
                     room_progress_monitors,
                     operator_controls.priority_zones,
                     operator_controls.no_go_zones,
+                    operator_paused_assignments,
                 )
                 if next_room is None:
                     send_idle_command(emitter, robot_name)
@@ -4910,7 +5720,7 @@ def run():
                     no_go_zones=operator_controls.no_go_zones,
                 )
                 coverage_plans.update(
-                    send_room_coverage_plans(
+                    send_room_work_plans(
                         emitter,
                         room_assignments,
                         next_room,
@@ -4919,11 +5729,9 @@ def run():
                         cleanup_plan_steps,
                         operator_controls.no_go_zones,
                         latest_robot_status,
+                        step_count,
                     )
                 )
-                cleanup_plan_signatures.pop(robot_name, None)
-                cleanup_plan_steps.pop(robot_name, None)
-                cleaning_overlay.release_robot_claims(robot_name)
                 last_cleaning_poses.pop(robot_name, None)
                 next_room_progress = cleaning_overlay.room_progress_percent(
                     next_room,
