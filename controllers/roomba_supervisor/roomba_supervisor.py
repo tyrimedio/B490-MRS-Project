@@ -7,6 +7,8 @@ layer for the future shared map and task assignment system.
 
 import json
 import math
+import os
+from datetime import datetime
 from pathlib import Path
 
 from controller import Supervisor
@@ -21,7 +23,8 @@ SCAN_MATCH_MIN_INFORMATIVE_CELLS = 2
 GROUND_TRUTH_DRIFT_CORRECTION_M = 0.45
 GROUND_TRUTH_HEADING_CORRECTION_RAD = 0.75
 LOCALIZATION_MIN_CONFIDENCE = 0.35
-EXPECTED_ROBOTS = ("epuck_1", "epuck_2", "epuck_3", "epuck_4")
+DEFAULT_EXPECTED_ROBOTS = ("epuck_1", "epuck_2", "epuck_3", "epuck_4")
+EXPECTED_ROBOTS = DEFAULT_EXPECTED_ROBOTS
 ROBOT_DEF_NAMES = {
     "epuck_1": "EPUCK_1",
     "epuck_2": "EPUCK_2",
@@ -72,7 +75,12 @@ TRAFFIC_MAX_START_DELAY_STEPS = 120
 OPERATOR_CONTROL_FILE = "operator_controls.json"
 OPERATOR_STATE_FILE = "operator_state.json"
 EVALUATION_METRICS_FILE = "evaluation_metrics.json"
+EVALUATION_RUN_CONFIG_FILE = "evaluation_run_config.json"
+EVALUATION_RUNS_DIR = "evaluation_runs"
 SINGLE_ROBOT_BASELINE_FILE = "single_robot_baseline.json"
+ROOMBA_ACTIVE_ROBOTS_ENV = "ROOMBA_ACTIVE_ROBOTS"
+ROOMBA_ROBOT_COUNT_ENV = "ROOMBA_ROBOT_COUNT"
+ROOMBA_RUN_LABEL_ENV = "ROOMBA_RUN_LABEL"
 OPERATOR_CONTROL_POLL_STEPS = 30
 OPERATOR_STATE_WRITE_STEPS = 15
 OPERATOR_MAX_PRIORITY_ZONES = 6
@@ -139,6 +147,141 @@ ROOM_TASKS = {
         "area_m2": 1.5 * 2.25,
     },
 }
+
+
+def active_robot_names_from_value(raw_names):
+    """Return valid robot names from a list or comma-separated string."""
+    if isinstance(raw_names, str):
+        candidates = raw_names.replace(",", " ").split()
+    elif isinstance(raw_names, (list, tuple)):
+        candidates = raw_names
+    else:
+        return ()
+
+    robot_names = []
+    for candidate in candidates:
+        robot_name = str(candidate).strip()
+        if robot_name not in DEFAULT_EXPECTED_ROBOTS:
+            continue
+        if robot_name in robot_names:
+            continue
+        robot_names.append(robot_name)
+    return tuple(robot_names)
+
+
+def active_robot_names_from_count(raw_count):
+    """Return the first N robots for simple one-vs-four evaluation runs."""
+    try:
+        robot_count = int(raw_count)
+    except (TypeError, ValueError):
+        return ()
+
+    if robot_count < 1:
+        return ()
+    robot_count = min(robot_count, len(DEFAULT_EXPECTED_ROBOTS))
+    return DEFAULT_EXPECTED_ROBOTS[:robot_count]
+
+
+def safe_run_label(raw_label):
+    """Return a short filename-safe label for one evaluation run."""
+    if raw_label is None:
+        return ""
+
+    safe_characters = []
+    for character in str(raw_label).strip().lower():
+        if character.isalnum():
+            safe_characters.append(character)
+        elif character in (" ", "-", "_"):
+            safe_characters.append("_")
+
+    label = "".join(safe_characters).strip("_")
+    while "__" in label:
+        label = label.replace("__", "_")
+    return label[:48]
+
+
+def default_run_label(active_robots):
+    """Return a readable label when the user did not name the run."""
+    robot_count = len(active_robots)
+    if robot_count == 1:
+        return "single_robot"
+    return f"{robot_count}_robots"
+
+
+def load_evaluation_run_config(config_path, environment=None):
+    """
+    Read optional run settings for evaluation.
+
+    The config file is intentionally small: it can name the active robots and
+    give the run a label. Environment variables override the file so quick
+    terminal runs do not need file edits.
+    """
+    raw_config = {}
+    path = Path(config_path)
+    if path.exists():
+        try:
+            loaded_config = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            loaded_config = {}
+        if isinstance(loaded_config, dict):
+            raw_config = loaded_config
+
+    if environment is None:
+        environment = os.environ
+
+    active_robots = active_robot_names_from_value(raw_config.get("active_robots"))
+    if not active_robots:
+        active_robots = active_robot_names_from_count(raw_config.get("robot_count"))
+
+    env_active_robots = active_robot_names_from_value(
+        environment.get(ROOMBA_ACTIVE_ROBOTS_ENV)
+    )
+    if env_active_robots:
+        active_robots = env_active_robots
+    else:
+        env_robot_count = active_robot_names_from_count(
+            environment.get(ROOMBA_ROBOT_COUNT_ENV)
+        )
+        if env_robot_count:
+            active_robots = env_robot_count
+
+    if not active_robots:
+        active_robots = DEFAULT_EXPECTED_ROBOTS
+
+    run_label = environment.get(ROOMBA_RUN_LABEL_ENV) or raw_config.get("run_label")
+    run_label = safe_run_label(run_label) or default_run_label(active_robots)
+    return {
+        "active_robots": tuple(active_robots),
+        "run_label": run_label,
+    }
+
+
+def configure_expected_robots(active_robots):
+    """Update the supervisor-wide robot list for this run."""
+    global EXPECTED_ROBOTS
+    robot_names = active_robot_names_from_value(active_robots)
+    if not robot_names:
+        robot_names = DEFAULT_EXPECTED_ROBOTS
+    EXPECTED_ROBOTS = tuple(robot_names)
+    return EXPECTED_ROBOTS
+
+
+def remove_inactive_robot_nodes(supervisor, active_robots):
+    """Remove unused robots so a one-robot run is not blocked by parked robots."""
+    active_robot_set = set(active_robots)
+    removed_robots = []
+    for robot_name, def_name in ROBOT_DEF_NAMES.items():
+        if robot_name in active_robot_set:
+            continue
+        robot_node = supervisor.getFromDef(def_name)
+        if robot_node is None:
+            continue
+        remove_node = getattr(robot_node, "remove", None)
+        if callable(remove_node):
+            remove_node()
+            removed_robots.append(robot_name)
+    return removed_robots
+
 
 def normalize_angle(angle_rad):
     """Keep an angle between -pi and pi."""
@@ -1674,7 +1817,10 @@ def get_actual_robot_pose(supervisor, robot_name):
 def reset_webots_robot_poses(supervisor):
     """Move each robot back to its initial world pose without reloading Webots."""
     reset_count = 0
-    for robot_name, def_name in ROBOT_DEF_NAMES.items():
+    for robot_name in EXPECTED_ROBOTS:
+        def_name = ROBOT_DEF_NAMES.get(robot_name)
+        if def_name is None:
+            continue
         robot_node = supervisor.getFromDef(def_name)
         start_pose = ROBOT_START_POSES.get(robot_name)
         if robot_node is None or start_pose is None:
@@ -2736,12 +2882,80 @@ def default_evaluation_metrics_snapshot():
     }
 
 
+def unique_evaluation_run_path(repo_root, run_id):
+    """Return a run metrics path that will not overwrite an earlier run."""
+    run_dir = Path(repo_root) / EVALUATION_RUNS_DIR
+    candidate = run_dir / f"{run_id}.json"
+    suffix = 2
+    while candidate.exists():
+        candidate = run_dir / f"{run_id}_{suffix}.json"
+        suffix += 1
+    return candidate
+
+
+def start_evaluation_run_metadata(repo_root, active_robots, run_label, now=None):
+    """Create metadata and a unique output path for one simulation run."""
+    if now is None:
+        now = datetime.now().astimezone()
+
+    label = safe_run_label(run_label) or default_run_label(active_robots)
+    run_id = f"{now.strftime('%Y%m%d_%H%M%S_%f')}_{label}"
+    run_path = unique_evaluation_run_path(repo_root, run_id)
+    try:
+        relative_run_path = str(run_path.relative_to(repo_root))
+    except ValueError:
+        relative_run_path = str(run_path)
+
+    return {
+        "run_id": run_path.stem,
+        "run_label": label,
+        "run_started_at": now.isoformat(timespec="seconds"),
+        "active_robots": list(active_robots),
+        "robot_count": len(active_robots),
+        "run_metrics_file": relative_run_path,
+    }, run_path
+
+
+def evaluation_metrics_export(
+    metrics_snapshot,
+    run_metadata,
+    step_count=None,
+    webots_time_s=None,
+    completed_rooms=None,
+    room_progress=None,
+):
+    """Combine run metadata with the latest serializable metrics snapshot."""
+    export = dict(metrics_snapshot)
+    export.update(run_metadata)
+    export["run_status"] = (
+        "complete"
+        if metrics_snapshot.get("complete_cleaning_time_s") is not None
+        else "running"
+    )
+    if step_count is not None:
+        export["last_step"] = step_count
+    if webots_time_s is not None:
+        export["last_webots_time_s"] = round(webots_time_s, 3)
+    if completed_rooms is not None:
+        export["completed_rooms"] = sorted(completed_rooms)
+    if room_progress is not None:
+        export["room_progress_percent"] = {
+            room: round(percent, 1)
+            for room, percent in sorted(room_progress.items())
+        }
+    export["last_updated_at"] = datetime.now().astimezone().isoformat(
+        timespec="seconds"
+    )
+    return export
+
+
 def load_single_robot_baseline(baseline_path):
     """
     Read the optional single-robot baseline time.
 
     The baseline file can be either a number or a JSON object with
-    cleaning_time_s, coverage_95_time_s, or complete_cleaning_time_s.
+    cleaning_time_s, elapsed_cleaning_time_s, coverage_95_time_s, or
+    complete_cleaning_time_s.
     """
     path = Path(baseline_path)
     if not path.exists():
@@ -2756,9 +2970,12 @@ def load_single_robot_baseline(baseline_path):
     if isinstance(raw_baseline, (int, float)):
         baseline_time_s = float(raw_baseline)
     elif isinstance(raw_baseline, dict):
+        if isinstance(raw_baseline.get("metrics"), dict):
+            raw_baseline = raw_baseline["metrics"]
         baseline_time_s = None
         baseline_keys = (
             ("cleaning_time_s", "elapsed_cleaning_time_s"),
+            ("elapsed_cleaning_time_s", "elapsed_cleaning_time_s"),
             ("coverage_95_time_s", "coverage_target_time_s"),
             ("coverage_target_time_s", "coverage_target_time_s"),
             ("complete_cleaning_time_s", "complete_cleaning_time_s"),
@@ -3166,6 +3383,30 @@ def write_evaluation_metrics_file(metrics_path, metrics_snapshot):
         encoding="utf-8",
     )
     temp_path.replace(path)
+
+
+def write_evaluation_metrics_outputs(
+    latest_metrics_path,
+    run_metrics_path,
+    metrics_snapshot,
+    run_metadata,
+    step_count=None,
+    webots_time_s=None,
+    completed_rooms=None,
+    room_progress=None,
+):
+    """Write the live metrics file and this run's archived metrics file."""
+    metrics_export = evaluation_metrics_export(
+        metrics_snapshot,
+        run_metadata,
+        step_count,
+        webots_time_s,
+        completed_rooms,
+        room_progress,
+    )
+    write_evaluation_metrics_file(latest_metrics_path, metrics_export)
+    write_evaluation_metrics_file(run_metrics_path, metrics_export)
+    return metrics_export
 
 
 def reset_operator_state_file(state_path):
@@ -4742,6 +4983,12 @@ def run():
     emitter = supervisor.getDevice("emitter")
 
     repo_root = Path(__file__).resolve().parents[2]
+    evaluation_run_config = load_evaluation_run_config(
+        repo_root / EVALUATION_RUN_CONFIG_FILE
+    )
+    configure_expected_robots(evaluation_run_config["active_robots"])
+    removed_inactive_robots = remove_inactive_robot_nodes(supervisor, EXPECTED_ROBOTS)
+
     operator_control_path = repo_root / OPERATOR_CONTROL_FILE
     reset_operator_control_file(operator_control_path, preserve_zones=True)
 
@@ -4750,6 +4997,13 @@ def run():
     operator_controls = OperatorControls(supervisor, operator_control_path)
     operator_state_path = repo_root / OPERATOR_STATE_FILE
     evaluation_metrics_path = repo_root / EVALUATION_METRICS_FILE
+    evaluation_run_metadata, evaluation_run_metrics_path = (
+        start_evaluation_run_metadata(
+            repo_root,
+            EXPECTED_ROBOTS,
+            evaluation_run_config["run_label"],
+        )
+    )
     single_robot_baseline = load_single_robot_baseline(
         repo_root / SINGLE_ROBOT_BASELINE_FILE
     )
@@ -4790,11 +5044,25 @@ def run():
     assignments_sent = False
     step_count = 0
     reset_operator_state_file(operator_state_path)
+    try:
+        write_evaluation_metrics_outputs(
+            evaluation_metrics_path,
+            evaluation_run_metrics_path,
+            evaluation_metrics.snapshot(step_count, last_webots_time_s),
+            evaluation_run_metadata,
+            step_count,
+            last_webots_time_s,
+            completed_rooms,
+            room_progress_snapshot(cleaning_overlay, operator_controls.no_go_zones),
+        )
+    except OSError as exc:
+        print(f"[supervisor] Could not initialize evaluation metrics file: {exc}")
 
-    def clear_runtime_after_sim_reset():
+    def clear_runtime_after_sim_reset(current_webots_time_s=None):
         """Clear supervisor memory that should not survive a sim reset."""
         nonlocal global_grid, traffic_reservations, assignments_sent
         nonlocal last_operator_no_go_signature
+        nonlocal evaluation_run_metadata, evaluation_run_metrics_path
 
         global_grid = GlobalOccupancyGrid(world_size_m=6.0, cell_size_m=0.05)
         latest_robot_status.clear()
@@ -4823,8 +5091,51 @@ def run():
         except Exception as exc:
             print(f"[supervisor] Could not reset cleaning overlay: {exc}")
         reset_operator_state_file(operator_state_path)
+        reset_time_s = last_webots_time_s
+        if current_webots_time_s is not None:
+            reset_time_s = current_webots_time_s
+        evaluation_run_metadata, evaluation_run_metrics_path = (
+            start_evaluation_run_metadata(
+                repo_root,
+                EXPECTED_ROBOTS,
+                evaluation_run_config["run_label"],
+            )
+        )
+        print(
+            "[supervisor] Started new evaluation metrics run: "
+            f"{evaluation_run_metadata['run_metrics_file']}"
+        )
+        try:
+            write_evaluation_metrics_outputs(
+                evaluation_metrics_path,
+                evaluation_run_metrics_path,
+                evaluation_metrics.snapshot(step_count, reset_time_s),
+                evaluation_run_metadata,
+                step_count,
+                reset_time_s,
+                completed_rooms,
+                room_progress_snapshot(
+                    cleaning_overlay,
+                    operator_controls.no_go_zones,
+                ),
+            )
+        except OSError as exc:
+            print(f"[supervisor] Could not initialize evaluation metrics file: {exc}")
 
     print("[supervisor] Starting central communication hub")
+    print(
+        "[supervisor] Active robot set: "
+        + ", ".join(EXPECTED_ROBOTS)
+    )
+    if removed_inactive_robots:
+        print(
+            "[supervisor] Removed inactive robot(s) for this run: "
+            + ", ".join(removed_inactive_robots)
+        )
+    print(
+        "[supervisor] Writing archived run metrics to "
+        f"{evaluation_run_metadata['run_metrics_file']}"
+    )
     print(
         f"[supervisor] Global map ready: "
         f"{global_grid.width}x{global_grid.height} cells"
@@ -4852,7 +5163,7 @@ def run():
             operator_controls.last_mtime_ns = None
             operator_controls.load(step_count)
             operator_controls.update_visuals(step_count)
-            clear_runtime_after_sim_reset()
+            clear_runtime_after_sim_reset(webots_time_s)
         last_webots_time_s = webots_time_s
 
         operator_controls.load_if_due(step_count)
@@ -4865,7 +5176,7 @@ def run():
             operator_controls.last_mtime_ns = None
             operator_controls.load(step_count)
             operator_controls.update_visuals(step_count)
-            clear_runtime_after_sim_reset()
+            clear_runtime_after_sim_reset(webots_time_s)
             send_sim_reset_command(emitter)
             reset_count = reset_webots_robot_poses(supervisor)
             print(
@@ -4896,6 +5207,9 @@ def run():
                 continue
 
             robot_name = message.get("robot", "unknown_robot")
+            if robot_name not in EXPECTED_ROBOTS:
+                continue
+
             first_message = robot_name not in latest_robot_status
             raw_map_update = message.get("map_update", {})
             scan_match = global_grid.scan_match_update(raw_map_update)
@@ -5762,9 +6076,19 @@ def run():
                     operator_state_path,
                     operator_state,
                 )
-                write_evaluation_metrics_file(
+                metrics_room_progress = room_progress_snapshot(
+                    cleaning_overlay,
+                    operator_controls.no_go_zones,
+                )
+                write_evaluation_metrics_outputs(
                     evaluation_metrics_path,
+                    evaluation_run_metrics_path,
                     operator_state["metrics"],
+                    evaluation_run_metadata,
+                    step_count,
+                    webots_time_s,
+                    completed_rooms,
+                    metrics_room_progress,
                 )
             except OSError as exc:
                 if (
@@ -5775,7 +6099,9 @@ def run():
                     print(f"[supervisor] Could not write dashboard metrics: {exc}")
 
         if step_count % COMMUNICATION_SUMMARY_INTERVAL_STEPS == 0:
-            connected_count = len(latest_robot_status)
+            connected_count = sum(
+                1 for robot in EXPECTED_ROBOTS if robot in latest_robot_status
+            )
             progress_snapshot = room_progress_snapshot(
                 cleaning_overlay,
                 operator_controls.no_go_zones,
