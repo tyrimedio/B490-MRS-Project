@@ -1,0 +1,28 @@
+{
+  "single_robot_result_file": "evaluation_runs/20260429_195125_422304_single_robot_baseline.json",
+  "four_robot_result_file": "evaluation_runs/20260429_195626_435933_four_robot_comparison.json",
+  "single_robot": {
+    "run_id": "20260429_195125_422304_single_robot_baseline",
+    "coverage_percent": 100.0,
+    "complete_cleaning_time_s": 1912.3,
+    "coverage_target_time_s": 1806.2,
+    "collisions": 0,
+    "minimum_robot_spacing_m": null
+  },
+  "four_robot": {
+    "run_id": "20260429_195626_435933_four_robot_comparison",
+    "coverage_percent": 100.0,
+    "complete_cleaning_time_s": 535.7,
+    "coverage_target_time_s": 444.5,
+    "collisions": 0,
+    "minimum_robot_spacing_m": 0.198
+  },
+  "difference": {
+    "time_saved_s": 1376.6,
+    "time_reduction_percent": 72.0,
+    "speedup_multiplier": 3.57,
+    "coverage_difference_percent": 0.0,
+    "collision_difference": 0,
+    "coverage_target_time_saved_s": 1361.7
+  }
+}
