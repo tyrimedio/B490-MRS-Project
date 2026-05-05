@@ -1,0 +1,9 @@
+{
+  "run_label": "four_robot_demo",
+  "active_robots": [
+    "epuck_1",
+    "epuck_2",
+    "epuck_3",
+    "epuck_4"
+  ]
+}

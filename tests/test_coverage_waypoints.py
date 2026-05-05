@@ -6,6 +6,7 @@ import sys
 import tempfile
 import types
 import unittest
+from datetime import datetime
 from pathlib import Path
 
 
@@ -1796,6 +1797,20 @@ class CoverageWaypointTests(unittest.TestCase):
             complete_baseline = supervisor.load_single_robot_baseline(baseline_path)
 
             baseline_path.write_text(
+                json.dumps({"elapsed_cleaning_time_s": 77.7}),
+                encoding="utf-8",
+            )
+            saved_run_baseline = supervisor.load_single_robot_baseline(baseline_path)
+
+            baseline_path.write_text(
+                json.dumps({"metrics": {"elapsed_cleaning_time_s": 66.6}}),
+                encoding="utf-8",
+            )
+            nested_saved_run_baseline = supervisor.load_single_robot_baseline(
+                baseline_path
+            )
+
+            baseline_path.write_text(
                 json.dumps({"cleaning_time_s": -1.0}),
                 encoding="utf-8",
             )
@@ -1813,7 +1828,155 @@ class CoverageWaypointTests(unittest.TestCase):
             {"time_s": 88.0, "metric": "complete_cleaning_time_s"},
             complete_baseline,
         )
+        self.assertEqual(
+            {"time_s": 77.7, "metric": "elapsed_cleaning_time_s"},
+            saved_run_baseline,
+        )
+        self.assertEqual(
+            {"time_s": 66.6, "metric": "elapsed_cleaning_time_s"},
+            nested_saved_run_baseline,
+        )
         self.assertIsNone(invalid_baseline)
+
+    def test_evaluation_run_metadata_uses_unique_run_file(self):
+        supervisor = load_supervisor_module()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = Path(temp_dir)
+            now = datetime(2026, 4, 29, 12, 30, 0, 123456)
+            metadata, first_path = supervisor.start_evaluation_run_metadata(
+                repo_root,
+                ("epuck_1",),
+                "Single Robot Baseline",
+                now,
+            )
+            first_path.parent.mkdir(parents=True)
+            first_path.write_text("{}", encoding="utf-8")
+
+            second_metadata, second_path = supervisor.start_evaluation_run_metadata(
+                repo_root,
+                ("epuck_1",),
+                "Single Robot Baseline",
+                now,
+            )
+
+        self.assertEqual(["epuck_1"], metadata["active_robots"])
+        self.assertEqual(1, metadata["robot_count"])
+        self.assertIn("single_robot_baseline", metadata["run_id"])
+        self.assertNotEqual(first_path, second_path)
+        self.assertTrue(second_path.name.endswith("_2.json"))
+        self.assertEqual(second_path.stem, second_metadata["run_id"])
+
+    def test_evaluation_metrics_outputs_write_live_and_archived_files(self):
+        supervisor = load_supervisor_module()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = Path(temp_dir)
+            latest_path = repo_root / "evaluation_metrics.json"
+            run_metadata, run_path = supervisor.start_evaluation_run_metadata(
+                repo_root,
+                ("epuck_1", "epuck_2"),
+                "Two Robots",
+                datetime(2026, 4, 29, 12, 45, 0),
+            )
+            metrics_snapshot = supervisor.default_evaluation_metrics_snapshot()
+            metrics_snapshot["coverage_percent"] = 100.0
+            metrics_snapshot["complete_cleaning_time_s"] = 42.0
+
+            supervisor.write_evaluation_metrics_outputs(
+                latest_path,
+                run_path,
+                metrics_snapshot,
+                run_metadata,
+                step_count=120,
+                webots_time_s=12.3456,
+                completed_rooms={"n_medium", "se_small"},
+                room_progress={"n_medium": 100.0, "se_small": 100.0},
+            )
+
+            latest_metrics = json.loads(latest_path.read_text(encoding="utf-8"))
+            archived_metrics = json.loads(run_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(latest_metrics, archived_metrics)
+        self.assertEqual("complete", archived_metrics["run_status"])
+        self.assertEqual(2, archived_metrics["robot_count"])
+        self.assertEqual(120, archived_metrics["last_step"])
+        self.assertEqual(12.346, archived_metrics["last_webots_time_s"])
+        self.assertEqual(["n_medium", "se_small"], archived_metrics["completed_rooms"])
+
+    def test_evaluation_run_config_can_select_one_robot(self):
+        supervisor = load_supervisor_module()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "evaluation_run_config.json"
+            config_path.write_text(
+                json.dumps({"robot_count": 1}),
+                encoding="utf-8",
+            )
+            one_robot_config = supervisor.load_evaluation_run_config(
+                config_path,
+                environment={},
+            )
+
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "run_label": "Four robot demo",
+                        "active_robots": ["epuck_4", "bad_bot", "epuck_2"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            named_config = supervisor.load_evaluation_run_config(
+                config_path,
+                environment={},
+            )
+
+            env_override_config = supervisor.load_evaluation_run_config(
+                config_path,
+                environment={
+                    supervisor.ROOMBA_ROBOT_COUNT_ENV: "1",
+                    supervisor.ROOMBA_RUN_LABEL_ENV: "env baseline",
+                },
+            )
+
+        self.assertEqual(("epuck_1",), one_robot_config["active_robots"])
+        self.assertEqual("single_robot", one_robot_config["run_label"])
+        self.assertEqual(("epuck_4", "epuck_2"), named_config["active_robots"])
+        self.assertEqual("four_robot_demo", named_config["run_label"])
+        self.assertEqual(("epuck_1",), env_override_config["active_robots"])
+        self.assertEqual("env_baseline", env_override_config["run_label"])
+
+    def test_remove_inactive_robot_nodes_removes_unused_robots(self):
+        supervisor = load_supervisor_module()
+
+        class FakeNode:
+            def __init__(self):
+                self.removed = False
+
+            def remove(self):
+                self.removed = True
+
+        class FakeSupervisor:
+            def __init__(self):
+                self.nodes = {
+                    def_name: FakeNode()
+                    for def_name in supervisor.ROBOT_DEF_NAMES.values()
+                }
+
+            def getFromDef(self, def_name):
+                return self.nodes.get(def_name)
+
+        fake_supervisor = FakeSupervisor()
+
+        removed_robots = supervisor.remove_inactive_robot_nodes(
+            fake_supervisor,
+            ("epuck_1",),
+        )
+
+        self.assertEqual(["epuck_2", "epuck_3", "epuck_4"], removed_robots)
+        self.assertFalse(fake_supervisor.nodes["EPUCK_1"].removed)
+        self.assertTrue(fake_supervisor.nodes["EPUCK_2"].removed)
 
     def test_operator_state_reports_robot_rooms_and_progress(self):
         supervisor = load_supervisor_module()
